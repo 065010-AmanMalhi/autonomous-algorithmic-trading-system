@@ -1,0 +1,48 @@
+# Copy this file to config/<your_name>.yaml and customize locally.
+# Personal YAML configs are ignored by Git.
+student_name: "Team Member"
+portfolio:
+  starting_capital: 100000
+  stocks:
+    - { symbol: "COIN", high_beta_hint: true }
+    - { symbol: "AMD", high_beta_hint: true }
+    - { symbol: "HOOD", high_beta_hint: true }
+    - { symbol: "MU", high_beta_hint: true }
+    - { symbol: "NVDA", high_beta_hint: true }
+    - { symbol: "MSFT", high_beta_hint: false }
+    - { symbol: "AAPL", high_beta_hint: false }
+    - { symbol: "JPM", high_beta_hint: false }
+    - { symbol: "V", high_beta_hint: false }
+    - { symbol: "COST", high_beta_hint: false }
+    - { symbol: "UNH", high_beta_hint: false }
+    - { symbol: "XOM", high_beta_hint: false }
+    - { symbol: "LLY", high_beta_hint: false }
+    - { symbol: "BRK.B", high_beta_hint: false }
+    - { symbol: "CAT", high_beta_hint: false }
+risk:
+  max_position_weight_pct: 12
+  min_cash_buffer_pct: 5
+  min_confidence_to_trade: 0.55
+  max_trades_per_symbol_per_day: 1
+  daily_loss_stop_pct: 6
+hedging:
+  enabled: true
+  instrument: "SPY"
+  option_type: "put"
+  target_hedge_ratio: 0.5
+  max_expiration_days: 45
+  max_hedge_cost_pct_of_portfolio: 2.5
+llm:
+  provider: "groq"
+  model: "groq/llama-3.3-70b-versatile"
+  temperature: 0.2
+data:
+  lookback_days: 200
+  timeframe: "1Day"
+  beta_window_days: 120
+session:
+  start_time_et: "09:30"
+  end_time_et: "16:00"
+  cycle_interval_minutes: 30
+logs:
+  run_dir: "logs"
