@@ -18,6 +18,7 @@ ones hardcoded in the class file comment; generate your own.)
 """
 
 import os
+import math
 
 from mcp.server.fastmcp import FastMCP
 from alpaca.trading.client import TradingClient
@@ -33,6 +34,49 @@ ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 # endpoint — fake money, real order-routing behavior. Do not flip this to
 # False without a very deliberate conversation with yourself first.
 _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+
+
+def _execution_enabled() -> bool:
+    """Fail closed: order submission is disabled unless explicitly enabled."""
+    return os.getenv("TRADING_EXECUTION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def _options_enabled() -> bool:
+    """Options need a separate explicit opt-in in addition to execution mode."""
+    return os.getenv("TRADING_OPTIONS_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def _allowed_symbols() -> set[str]:
+    """Allowlist required for live paper-order submission; comma-separated tickers."""
+    return {s.strip().upper() for s in os.getenv("TRADING_ALLOWED_SYMBOLS", "").split(",") if s.strip()}
+
+
+def _validate_stock_order(symbol: str, action: str, amount: float, *, amount_name: str) -> str | None:
+    if not symbol or not symbol.replace(".", "").isalnum():
+        return "Invalid stock symbol."
+    if action not in {"buy", "sell"}:
+        return "Action must be 'buy' or 'sell'."
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool) or not math.isfinite(float(amount)) or amount <= 0:
+        return f"{amount_name} must be a finite positive number."
+    if _execution_enabled():
+        allowed = _allowed_symbols()
+        if not allowed:
+            return "Execution blocked: set TRADING_ALLOWED_SYMBOLS to an explicit comma-separated allowlist."
+        if symbol.upper() not in allowed:
+            return f"Execution blocked: {symbol.upper()} is not in TRADING_ALLOWED_SYMBOLS."
+    return None
+
+
+def _dry_run_result(symbol: str, action: str, *, qty=None, notional=None) -> dict:
+    return {
+        "status": "DRY_RUN",
+        "submitted": False,
+        "symbol": symbol.upper(),
+        "side": action.upper(),
+        "qty": qty,
+        "notional": notional,
+        "message": "No order was sent to Alpaca. Set TRADING_EXECUTION_ENABLED=true only after reviewing safeguards.",
+    }
 
 
 def _order_to_dict(order) -> dict:
@@ -59,6 +103,12 @@ def buy_stock(symbol: str, qty: float = None, notional: float = None) -> dict:
     """
     if (qty is None) == (notional is None):
         return {"error": "Pass exactly one of qty or notional, not both/neither."}
+    amount = qty if qty is not None else notional
+    error = _validate_stock_order(symbol.upper(), "buy", amount, amount_name="qty" if qty is not None else "notional")
+    if error:
+        return {"error": error, "submitted": False}
+    if not _execution_enabled():
+        return _dry_run_result(symbol, "buy", qty=qty, notional=notional)
     order_request = MarketOrderRequest(
         symbol=symbol.upper(),
         qty=qty,
@@ -78,6 +128,12 @@ def sell_stock(symbol: str, qty: float = None, notional: float = None) -> dict:
     """
     if (qty is None) == (notional is None):
         return {"error": "Pass exactly one of qty or notional, not both/neither."}
+    amount = qty if qty is not None else notional
+    error = _validate_stock_order(symbol.upper(), "sell", amount, amount_name="qty" if qty is not None else "notional")
+    if error:
+        return {"error": error, "submitted": False}
+    if not _execution_enabled():
+        return _dry_run_result(symbol, "sell", qty=qty, notional=notional)
     order_request = MarketOrderRequest(
         symbol=symbol.upper(),
         qty=qty,
@@ -125,13 +181,23 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
         symbol = d.get("symbol", "").upper()
         action = d.get("action", "hold").lower()
 
-        if action == "hold" or not symbol:
+        if action == "hold":
             results.append({"symbol": symbol, "action": "hold", "result": "skipped (hold)"})
+            continue
+        if not symbol:
+            results.append({"symbol": symbol, "action": action, "result": {"error": "Missing symbol", "submitted": False}})
+            continue
+        if action not in {"buy", "sell"}:
+            results.append({"symbol": symbol, "action": action, "result": {"error": "Action must be buy, sell, or hold", "submitted": False}})
             continue
 
         notional = d.get("notional")
-        if not notional or notional <= 0:
-            results.append({"symbol": symbol, "action": action, "result": "error: missing/invalid notional"})
+        error = _validate_stock_order(symbol, action, notional, amount_name="notional")
+        if error:
+            results.append({"symbol": symbol, "action": action, "result": {"error": error, "submitted": False}})
+            continue
+        if not _execution_enabled():
+            results.append({"symbol": symbol, "action": action, "result": _dry_run_result(symbol, action, notional=notional)})
             continue
 
         try:
@@ -169,6 +235,14 @@ def buy_option_hedge(option_symbol: str, contracts: int) -> dict:
     option_symbol : OCC-format contract symbol, e.g. "SPY251121P00580000".
     contracts     : Number of contracts to buy (whole number).
     """
+    if not _execution_enabled():
+        return {"status": "DRY_RUN", "submitted": False, "symbol": option_symbol, "contracts": contracts, "message": "No option order was sent to Alpaca."}
+    if not _options_enabled():
+        return {"error": "Options execution is disabled. Set TRADING_OPTIONS_ENABLED=true only after validating contract, premium, expiry, and hedge budget.", "submitted": False}
+    if not isinstance(contracts, int) or isinstance(contracts, bool) or contracts <= 0:
+        return {"error": "contracts must be a positive whole number", "submitted": False}
+    if not option_symbol or not option_symbol.startswith("SPY"):
+        return {"error": "Only SPY option symbols are permitted by this initial safety gate", "submitted": False}
     try:
         order_request = MarketOrderRequest(
             symbol=option_symbol,
@@ -192,6 +266,10 @@ def buy_option_hedge(option_symbol: str, contracts: int) -> dict:
 @mcp.tool()
 def close_option_position(option_symbol: str) -> dict:
     """Close an existing open option position (sell-to-close) by OCC symbol."""
+    if not _execution_enabled():
+        return {"status": "DRY_RUN", "submitted": False, "symbol": option_symbol, "message": "No close order was sent to Alpaca."}
+    if not _options_enabled():
+        return {"error": "Options execution is disabled. Set TRADING_OPTIONS_ENABLED=true only after validating the position.", "submitted": False}
     try:
         result = _trading_client.close_position(option_symbol)
         return {"symbol": option_symbol, "status": "close order submitted", "detail": str(result)}
@@ -248,6 +326,8 @@ def get_open_orders(symbol: str = "") -> dict:
 @mcp.tool()
 def cancel_all_orders(symbol: str = "") -> dict:
     """Cancel all open orders, optionally restricted to one symbol."""
+    if not _execution_enabled():
+        return {"status": "DRY_RUN", "cancelled": False, "message": "Execution disabled; no orders were cancelled."}
     if symbol:
         orders = _trading_client.get_orders()
         matching = [o for o in orders if o.symbol.upper() == symbol.upper()]

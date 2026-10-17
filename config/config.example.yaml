@@ -45,7 +45,7 @@ risk:
 
 # Hedging overlay (options-based tail hedge, per our earlier discussion).
 hedging:
-  enabled: true
+  enabled: false
   instrument: "SPY"              # or "QQQ" — hedge underlying
   option_type: "put"
   target_hedge_ratio: 0.5        # hedge ~50% of the portfolio's weighted beta exposure, not 100% — this is a tail hedge, not a full market-neutral overlay, since the brief wants aggressive upside too

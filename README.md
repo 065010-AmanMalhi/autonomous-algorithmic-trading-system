@@ -32,6 +32,8 @@ requirements.txt
 
 ## Setup guide
 
+A standalone team setup checklist is also available at [`docs/SETUP_GUIDE.md`](docs/SETUP_GUIDE.md).
+
 ### 1. Install prerequisites
 
 - Python 3.11 or 3.12 recommended.
@@ -49,11 +51,9 @@ git --version
 ### 2. Clone the repository
 
 ```bash
-git clone <REPOSITORY_URL>
-cd <REPOSITORY_FOLDER>
+git clone https://github.com/065010-AmanMalhi/autonomous-algorithmic-trading-system.git
+cd autonomous-algorithmic-trading-system
 ```
-
-Replace the placeholders with the URL and folder name of this repository.
 
 ### 3. Create and activate a virtual environment
 
@@ -150,7 +150,7 @@ Run from the **project root**:
 python scripts/run_session.py --config config/myname.yaml --once
 ```
 
-This runs one cycle and exits, without waiting for the regular market session. Check `logs/` for the generated agent reports and inspect the console for API, market-data, or options errors.
+This runs one cycle and exits, without waiting for the regular market session. Order tools are **dry-run by default** (`TRADING_EXECUTION_ENABLED=false`): intended orders should be reported as `DRY_RUN` and must not reach Alpaca. Check `logs/` for generated agent reports and inspect the console for API or market-data errors. Keep options disabled until contract and premium risk checks are implemented and reviewed.
 
 Before enabling the hedge, confirm that options trading and the required permissions are available on your Alpaca **paper** account. The options-related calls have not been verified against every version of `alpaca-py`; test this feature early and do not assume it is working solely because the code starts.
 
@@ -160,7 +160,7 @@ Before enabling the hedge, confirm that options trading and the required permiss
 python scripts/run_session.py --config config/myname.yaml
 ```
 
-The loop checks the configured US Eastern session window and runs a full agent cycle at the configured interval. Keep the terminal and machine awake while it runs. Stop with `Ctrl+C`.
+The loop checks the configured US Eastern clock window and runs a full agent cycle at the configured interval. Keep the terminal and machine awake while it runs. Stop with `Ctrl+C`. Order execution remains disabled by default. The runner does not yet check exchange holidays or market-calendar status.
 
 The daily-loss check blocks new cycles when the threshold is breached, but it does **not** liquidate existing positions or cancel open orders. Review positions and orders in Alpaca separately.
 
