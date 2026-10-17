@@ -1,0 +1,23 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+config/*.yaml
+!config/config.example.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.envrc
+
+# Runtime output
+logs/*
+!logs/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

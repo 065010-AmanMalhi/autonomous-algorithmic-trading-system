@@ -1,0 +1,10 @@
+crewai>=0.98.0
+crewai-tools>=0.32.0
+mcp>=1.2.0
+fastmcp>=2.0.0
+alpaca-py>=0.33.0
+pandas>=2.2.0
+pandas_ta>=0.3.14b0
+requests>=2.32.0
+pyyaml>=6.0
+python-dotenv>=1.0.1

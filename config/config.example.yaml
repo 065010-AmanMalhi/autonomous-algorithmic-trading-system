@@ -1,0 +1,76 @@
+# config.example.yaml
+# ---------------------------------------------------------------
+# Copy this to config/config.yaml (or config/<your_name>.yaml) and fill
+# in your own values. This is what makes the system reusable across all
+# three group members without touching any code — each of you keeps your
+# own config file and your own .env file.
+#
+# Run with:  python scripts/run_session.py --config config/aman.yaml
+# ---------------------------------------------------------------
+
+student_name: "Aman"
+
+# Your 15-stock subset (brief: 10-15 stocks/student, >=30% high-beta).
+# high_beta_hint is just a label for your own bookkeeping — the crew
+# re-verifies actual beta at runtime via calculate_beta, it does not
+# trust this flag blindly.
+portfolio:
+  starting_capital: 100000
+  stocks:
+    - { symbol: "COIN",  high_beta_hint: true }
+    - { symbol: "AMD",   high_beta_hint: true }
+    - { symbol: "HOOD",  high_beta_hint: true }
+    - { symbol: "MU",    high_beta_hint: true }
+    - { symbol: "NVDA",  high_beta_hint: true }
+    - { symbol: "MSFT",  high_beta_hint: false }
+    - { symbol: "AAPL",  high_beta_hint: false }
+    - { symbol: "JPM",   high_beta_hint: false }
+    - { symbol: "V",     high_beta_hint: false }
+    - { symbol: "COST",  high_beta_hint: false }
+    - { symbol: "UNH",   high_beta_hint: false }
+    - { symbol: "XOM",   high_beta_hint: false }
+    - { symbol: "LLY",   high_beta_hint: false }
+    - { symbol: "BRK.B", high_beta_hint: false }
+    - { symbol: "CAT",   high_beta_hint: false }
+
+# Risk / position-sizing rules the decision-maker agent must respect.
+# These exist because of the FSRPPO paper's core warning: don't trade
+# with full capital on every call, and don't churn positions.
+risk:
+  max_position_weight_pct: 12       # no single stock > 12% of portfolio value
+  min_cash_buffer_pct: 5            # always keep >= 5% of capital as cash
+  min_confidence_to_trade: 0.55     # decision-maker must state a 0-1 confidence; below this => hold
+  max_trades_per_symbol_per_day: 1  # avoid churn/overtrading per the paper's critique
+  daily_loss_stop_pct: 6            # if the paper account is down >= 6% intraday, agents stop opening NEW positions for the rest of the session (existing positions/hedge untouched)
+
+# Hedging overlay (options-based tail hedge, per our earlier discussion).
+hedging:
+  enabled: true
+  instrument: "SPY"              # or "QQQ" — hedge underlying
+  option_type: "put"
+  target_hedge_ratio: 0.5        # hedge ~50% of the portfolio's weighted beta exposure, not 100% — this is a tail hedge, not a full market-neutral overlay, since the brief wants aggressive upside too
+  max_expiration_days: 45
+  max_hedge_cost_pct_of_portfolio: 2.5   # cap premium spend so the hedge itself can't become the biggest line-item risk
+
+# LLM backend
+llm:
+  provider: "groq"
+  model: "groq/llama-3.3-70b-versatile"   # check console.groq.com/docs/models for current free-tier model names before each run — Groq rotates/deprecates models
+  temperature: 0.2
+
+# Indicator / data settings
+data:
+  lookback_days: 200
+  timeframe: "1Day"
+  beta_window_days: 120
+
+# Session scheduling (informational — enforced by scripts/run_session.py,
+# which must run on YOUR machine; this chat/cloud session cannot stay
+# alive for the full window).
+session:
+  start_time_et: "09:30"     # = 19:00 IST
+  end_time_et: "16:00"       # = 01:30 IST next day
+  cycle_interval_minutes: 30  # how often the crew re-runs within the window
+
+logs:
+  run_dir: "logs"
