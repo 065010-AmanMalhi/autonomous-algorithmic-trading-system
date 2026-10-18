@@ -5,7 +5,29 @@ MCP CLIENT — portfolio-level CrewAI trading crew.
 
 Rebuilt from the class starter trading_crew.py / trading_crew_1.py for a
 WHOLE-PORTFOLIO run (15 stocks at once, not one ticker per invocation),
-with a hedging agent and a daily self-improvement loop layered on top.
+with a hedging agent, a volatility/implied-volatility "fear" regression
+agent, and a daily self-improvement loop layered on top.
+
+Six agents run in sequence each cycle:
+    1. Data Fetcher          — batched OHLCV + VIXY (market fear proxy)
+    2. Technical Analyst     — RSI/MACD/Bollinger/beta cross-section
+    3. Volatility/Fear Agent — realized vol vs implied vol, market-wide
+                                fear level, and a linear-regression model
+                                that combines IV-RV spread, realized vol,
+                                relative volume, RSI and market fear into
+                                ONE fear_adjusted_signal per symbol (see
+                                calculate_fear_regression in
+                                technical_indicators_mcp_server.py for the
+                                full math + honest caveats about what an
+                                in-sample OLS fit can and can't tell you)
+    4. Hedging Agent         — sizes the SPY/QQQ tail hedge, leaning on
+                                both portfolio beta AND the fear agent's
+                                market-wide reading
+    5. Decision-Maker        — final buy/sell/hold + sizing, weighing
+                                technicals, the fear signal, and the hedge
+    6. Execution Agent       — submits the batch (independently
+                                re-validated server-side, see
+                                alpaca_orders_mcp_server.py)
 
 Prerequisites
 -------------
@@ -34,15 +56,12 @@ import sys
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai_tools import MCPServerAdapter
 from mcp import StdioServerParameters
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from logging_utils import save_agent_log, load_previous_decision_report
-
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 SERVERS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..",
@@ -67,6 +86,11 @@ def build_crew(cfg: dict, mcp_tools: list, yesterday_report: str | None):
     risk = cfg["risk"]
     hedging = cfg["hedging"]
     data_cfg = cfg["data"]
+    # volatility.* is optional in config.yaml — default to sane values so
+    # existing configs (aman/mayank/aditi.yaml) don't need editing to pick
+    # up this new agent.
+    volatility_cfg = cfg.get("volatility", {})
+    fear_window_days = volatility_cfg.get("fear_regression_window_days", 60)
 
     llm = LLM(
         model=cfg["llm"]["model"],
@@ -114,25 +138,69 @@ def build_crew(cfg: dict, mcp_tools: list, yesterday_report: str | None):
         verbose=True,
     )
 
+    volatility_fear_agent = Agent(
+        role="Volatility and Fear Regression Analyst",
+        goal=(
+            f"For EVERY symbol in {symbols}, call calculate_realized_volatility, "
+            f"get_iv_metrics, and calculate_fear_regression (window_days={fear_window_days}), "
+            "plus ONE call to get_market_volatility for the whole-market fear "
+            "level (do not call get_market_volatility per symbol — it's "
+            "market-wide, call it once). For each symbol report: realized "
+            "volatility, implied volatility (and the IV-RV spread — a wide "
+            "positive spread means the options market is pricing in more "
+            "future movement than has actually occurred, a classic sign the "
+            "market senses an event or elevated risk ahead), the regression's "
+            "fear_adjusted_signal and its interpretation, and the fit's R² "
+            "(explicitly flag any symbol where fit_r_squared is below 0.15 as "
+            "LOW CONFIDENCE — that reading should carry little weight). Open "
+            "with the overall market fear_level from get_market_volatility so "
+            "the rest of the crew has that context before anything else."
+        ),
+        backstory=(
+            "You are a volatility and derivatives-pricing specialist. You "
+            "think of implied volatility as the options market's own forecast "
+            "of future movement, and you compare it against what actually "
+            "happened (realized volatility) to gauge whether fear is being "
+            "priced in ahead of an event. You are honest about your own "
+            "model's limits — an in-sample linear regression over a short "
+            "window is a way to combine signals transparently, not a proven "
+            "forecast, and you say so plainly rather than overstating "
+            "confidence in a low-R² reading."
+        ),
+        tools=mcp_tools,
+        llm=llm,
+        verbose=True,
+    )
+
     hedging_agent = Agent(
         role="Hedging and Risk Overlay Agent",
         goal=(
             f"Using the portfolio's weighted average beta from the technical "
+            f"analyst AND the market-wide fear_level from the volatility "
             f"analyst, and {hedging['instrument']} option chain data, size a "
             f"tail-hedge ({hedging['option_type']} options) that covers "
             f"roughly {hedging['target_hedge_ratio']*100:.0f}% of the "
-            f"portfolio's beta-weighted dollar exposure. Cap total premium "
+            f"portfolio's beta-weighted dollar exposure under normal "
+            f"conditions — but lean toward the TOP of that range (more "
+            f"contracts, within the premium cap) when the volatility "
+            f"analyst's market fear_level is 'Elevated', and toward the "
+            f"bottom of the range when it is 'Complacent'. Cap total premium "
             f"spend at {hedging['max_hedge_cost_pct_of_portfolio']}% of "
-            f"portfolio value. State: underlying, strike, expiry, contract "
-            f"count, estimated premium cost, and what this hedge does and "
-            f"does NOT protect against (it will not offset single-stock "
-            f"idiosyncratic risk, only broad market moves)."
+            f"portfolio value regardless of fear level — never breach the cap "
+            f"just because fear is high. State: underlying, strike, expiry, "
+            f"contract count, estimated premium cost, how the market fear "
+            f"level influenced sizing, and what this hedge does and does NOT "
+            f"protect against (it will not offset single-stock idiosyncratic "
+            f"risk, only broad market moves)."
         ),
         backstory=(
             "You are a derivatives risk manager. Your job is capital "
             "preservation during tail events, not return-chasing — you are "
             "deliberately the most conservative voice on this team, same "
-            "role a risk desk plays at a real trading firm."
+            "role a risk desk plays at a real trading firm. You take the "
+            "volatility analyst's market fear reading seriously: options "
+            "pricing in more fear than usual is exactly the condition a tail "
+            "hedge exists for."
         ),
         tools=mcp_tools,
         llm=llm,
@@ -142,8 +210,16 @@ def build_crew(cfg: dict, mcp_tools: list, yesterday_report: str | None):
     decision_maker_agent = Agent(
         role="Portfolio Decision-Maker",
         goal=(
-            f"Given the technical analyst's cross-sectional table and the "
-            f"hedging agent's overlay recommendation{' and YESTERDAY-S RESULTS below' if yesterday_report else ''}, "
+            f"Given the technical analyst's cross-sectional table, the "
+            f"volatility analyst's per-symbol fear_adjusted_signal and "
+            f"market-wide fear_level, and the hedging agent's overlay "
+            f"recommendation{' and YESTERDAY-S RESULTS below' if yesterday_report else ''}, "
+            f"treat the fear_adjusted_signal as ONE additional input alongside "
+            f"the technical indicators — not a standalone trigger, and give "
+            f"little weight to any symbol's reading where the volatility "
+            f"analyst flagged LOW CONFIDENCE (fit_r_squared < 0.15). A "
+            f"Fear-leaning reading on a symbol you were otherwise bullish on "
+            f"is a reason to size down or wait, not necessarily to flip to sell. "
             f"decide buy/sell/hold AND a dollar amount for EVERY symbol in "
             f"{symbols} simultaneously, allocating against a ${capital:,.0f} "
             f"starting capital base. Hard rules you MUST follow: "
@@ -207,9 +283,9 @@ def build_crew(cfg: dict, mcp_tools: list, yesterday_report: str | None):
         description=(
             f"Call fetch_ohlcv_batch ONCE with symbols={symbols}, "
             f"lookback_days={data_cfg['lookback_days']}, "
-            f"timeframe='{data_cfg['timeframe']}', include_benchmark=True. "
-            "Confirm every symbol was cached successfully; flag any that "
-            "came back missing."
+            f"timeframe='{data_cfg['timeframe']}', include_benchmark=True, "
+            f"include_market_fear_proxy=True. Confirm every symbol was "
+            "cached successfully; flag any that came back missing."
         ),
         expected_output="Per-symbol bar counts and date range; list of any missing symbols.",
         agent=data_fetcher_agent,
@@ -229,30 +305,57 @@ def build_crew(cfg: dict, mcp_tools: list, yesterday_report: str | None):
         context=[task_fetch],
     )
 
+    task_volatility_fear = Task(
+        description=(
+            f"Call get_market_volatility ONCE for the market-wide fear "
+            f"level. Then for every symbol in {symbols}, call "
+            f"calculate_realized_volatility, get_iv_metrics, and "
+            f"calculate_fear_regression (window_days={fear_window_days}). "
+            "Build one consolidated table: Symbol, Realized Vol, Implied "
+            "Vol, IV-RV Spread, Fear-Adjusted Signal, Interpretation, R², "
+            "Confidence. Open with the market-wide fear_level and "
+            "percentile_rank. Clearly flag any symbol where IV data was "
+            "unavailable (iv_available: false) — this is expected if "
+            "options aren't enabled yet or a ticker has no listed options; "
+            "don't treat it as an error, just note the regression ran "
+            "without the IV-RV term for that symbol."
+        ),
+        expected_output=(
+            "Market-wide fear_level/percentile_rank, followed by one "
+            "consolidated per-symbol volatility/fear table."
+        ),
+        agent=volatility_fear_agent,
+        context=[task_fetch],
+    )
+
     task_hedge = Task(
         description=(
-            f"Using the technical analyst's weighted average beta, call "
+            f"Using the technical analyst's weighted average beta AND the "
+            f"volatility analyst's market-wide fear_level, call "
             f"get_option_chain for underlying='{hedging['instrument']}', "
             f"option_type='{hedging['option_type']}', "
             f"max_expiration_days={hedging['max_expiration_days']}. "
             "Pick a near-the-money strike and a short-dated expiry inside "
             "that window, size the contract count to cover roughly "
             f"{hedging['target_hedge_ratio']*100:.0f}% of the portfolio's "
-            f"beta-weighted dollar exposure, and keep total estimated "
-            f"premium under {hedging['max_hedge_cost_pct_of_portfolio']}% "
-            f"of ${capital:,.0f}. If hedging.enabled is False or no "
+            f"beta-weighted dollar exposure (lean toward more contracts, "
+            f"within the cap, if fear_level is 'Elevated'; fewer if "
+            f"'Complacent'), and keep total estimated premium under "
+            f"{hedging['max_hedge_cost_pct_of_portfolio']}% of ${capital:,.0f} "
+            f"NO MATTER the fear level. If hedging.enabled is False or no "
             "suitable contract is found, explicitly recommend hedge "
             "contracts=0 and say why."
         ),
         expected_output=(
             "A hedge recommendation stating underlying, option_symbol, "
-            "strike, expiry, contracts, estimated premium, and limitations."
+            "strike, expiry, contracts, estimated premium, how market fear "
+            "level influenced sizing, and limitations."
         ),
         agent=hedging_agent,
-        context=[task_analyze],
+        context=[task_analyze, task_volatility_fear],
     )
 
-    decision_context = [task_analyze, task_hedge]
+    decision_context = [task_analyze, task_volatility_fear, task_hedge]
     yesterday_note = ""
     if yesterday_report:
         yesterday_note = (
@@ -291,10 +394,13 @@ def build_crew(cfg: dict, mcp_tools: list, yesterday_report: str | None):
 
     crew = Crew(
         agents=[
-            data_fetcher_agent, technical_analyst_agent, hedging_agent,
-            decision_maker_agent, execution_agent,
+            data_fetcher_agent, technical_analyst_agent, volatility_fear_agent,
+            hedging_agent, decision_maker_agent, execution_agent,
         ],
-        tasks=[task_fetch, task_analyze, task_hedge, task_decide, task_execute],
+        tasks=[
+            task_fetch, task_analyze, task_volatility_fear, task_hedge,
+            task_decide, task_execute,
+        ],
         process=Process.sequential,
         verbose=True,
     )
@@ -302,6 +408,7 @@ def build_crew(cfg: dict, mcp_tools: list, yesterday_report: str | None):
     agent_task_pairs = [
         ("PortfolioDataFetcher", task_fetch),
         ("PortfolioTechnicalAnalyst", task_analyze),
+        ("VolatilityFearAnalyst", task_volatility_fear),
         ("HedgingRiskAgent", task_hedge),
         ("PortfolioDecisionMaker", task_decide),
         ("PortfolioExecutionAgent", task_execute),
@@ -317,15 +424,27 @@ def run_one_cycle(config_path: str):
     cfg = load_config(config_path)
     log_dir = cfg["logs"]["run_dir"]
 
+    # The orders server independently re-enforces risk.* and hedging.*
+    # from config.yaml rather than trusting the agent's own arithmetic —
+    # it needs the config path and an ABSOLUTE log dir (so its halt-file
+    # and trade-ledger paths resolve the same way regardless of the
+    # subprocess's working directory) to do that. See the big docstring
+    # at the top of alpaca_orders_mcp_server.py for why this exists.
+    server_env = {
+        **os.environ,
+        "TRADING_CONFIG_PATH": os.path.abspath(config_path),
+        "TRADING_LOG_DIR": os.path.abspath(log_dir),
+    }
+
     indicators_server = StdioServerParameters(
         command="python",
         args=[os.path.join(SERVERS_DIR, "technical_indicators_mcp_server.py")],
-        env={**os.environ},
+        env=server_env,
     )
     orders_server = StdioServerParameters(
         command="python",
         args=[os.path.join(SERVERS_DIR, "alpaca_orders_mcp_server.py")],
-        env={**os.environ},
+        env=server_env,
     )
 
     # Connects to BOTH local MCP servers at once; mcp_tools ends up as the
