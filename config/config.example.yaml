@@ -45,7 +45,7 @@ risk:
 
 # Hedging overlay (options-based tail hedge, per our earlier discussion).
 hedging:
-  enabled: true
+  enabled: false
   instrument: "SPY"              # or "QQQ" — hedge underlying
   option_type: "put"
   target_hedge_ratio: 0.5        # hedge ~50% of the portfolio's weighted beta exposure, not 100% — this is a tail hedge, not a full market-neutral overlay, since the brief wants aggressive upside too
@@ -55,16 +55,17 @@ hedging:
 # LLM backend
 llm:
   provider: "groq"
-  model: "groq/llama-3.3-70b-versatile"   # check console.groq.com/docs/models for current free-tier model names before each run — Groq rotates/deprecates models
-  temperature: 0.2
+  model: "groq/openai/gpt-oss-20b"   # check console.groq.com/docs/models for current free-tier model names before each run — Groq rotates/deprecates models
+  temperature: 0.1
+  max_tokens: 1200
 
 # Indicator / data settings
 data:
-  lookback_days: 200
+  lookback_days: 120
   timeframe: "1Day"
-  beta_window_days: 120
+  beta_window_days: 60
 
-# Volatility / implied-volatility "fear" regression agent settings.
+# Legacy optional volatility settings (not used in compact mode).
 # calculate_fear_regression needs at least fear_regression_window_days + 30
 # cached trading days (RSI's own warm-up period) — data.lookback_days above
 # (200 calendar days ≈ 135-140 trading days) comfortably covers the

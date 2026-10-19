@@ -353,6 +353,55 @@ def calculate_beta(symbol: str, window_days: int = 120) -> dict:
 # 4.4 calculate_realized_volatility — annualized historical volatility,
 # the "RV" half of the IV-vs-RV comparison the fear agent needs.
 # ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# 4.4 calculate_portfolio_snapshot — deterministic compact tool
+# ------------------------------------------------------------
+@mcp.tool()
+def calculate_portfolio_snapshot(
+    symbols: list[str],
+    beta_window_days: int = 60,
+) -> dict:
+    """
+    Return one compact technical-indicator + realized-beta snapshot for a
+    whole portfolio. This tool is optimized for token-limited LLM agents:
+    all math runs locally and the model receives just one compact response.
+    fetch_ohlcv_batch must be called first.
+    """
+    rows = []
+    missing = []
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol).upper().strip()
+        try:
+            indicators = calculate_indicators(symbol)
+            beta_result = calculate_beta(symbol, beta_window_days)
+            rows.append({
+                "symbol": symbol,
+                "close": indicators.get("latest_close"),
+                "rsi": (indicators.get("rsi") or {}).get("value"),
+                "rsi_signal": (indicators.get("rsi") or {}).get("signal"),
+                "macd": (indicators.get("macd") or {}).get("crossover"),
+                "bb_percent_b": (indicators.get("bollinger") or {}).get("percent_b"),
+                "trend": indicators.get("trend"),
+                "relative_volume": indicators.get("relative_volume"),
+                "beta": beta_result.get("beta"),
+                "beta_class": beta_result.get("classification"),
+            })
+        except Exception as exc:
+            missing.append({"symbol": symbol, "error": str(exc)[:160]})
+
+    valid_betas = [row["beta"] for row in rows if isinstance(row["beta"], (int, float))]
+    average_beta = round(sum(valid_betas) / len(valid_betas), 3) if valid_betas else None
+    return {
+        "status": "ok" if not missing else ("partial" if rows else "error"),
+        "rows": rows,
+        "equal_weight_average_beta": average_beta,
+        "missing": missing,
+        "note": "Metrics are calculated locally; this response is intended to stay compact.",
+    }
+
+
 @mcp.tool()
 def calculate_realized_volatility(symbol: str, window_days: int = 20) -> dict:
     """

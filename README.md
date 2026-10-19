@@ -2,14 +2,14 @@
 
 CrewAI + MCP autonomous paper-trading system for the "Trade Algorithmically
 using Trading Agents" brief. Trades a whole 15-stock portfolio at once
-(not one ticker per run), with a volatility/implied-volatility "fear"
-regression agent, an options-based tail hedge, and a day-over-day
-self-improvement loop.
+(not one ticker per run), with a compact technical-analysis workflow designed for Groq's free-tier
+token-per-minute limits. Optional volatility/fear regression and options
+tools remain in the MCP server but are not used in the default cycle.
 
 Built on top of the class starter files (`trading_crew.py`,
 `technical_indicators_mcp_server.py`, `alpaca_trading_mcpServer.py`) —
 extended for batched multi-symbol data, a portfolio-level decision maker,
-hedging, and reusability across all three group members.
+reusability across all three group members; optional hedging remains disabled in the example config.
 
 ## ⚠️ Security note
 
@@ -26,17 +26,14 @@ here already excludes both — keep it that way).
 mcp_servers/stock_trading/servers/
     technical_indicators_mcp_server.py   MCP server 1: batched OHLCV fetch,
                                           indicators (RSI/MACD/Bollinger/
-                                          ATR/trend), realized beta, realized
-                                          vs implied volatility, market-wide
-                                          fear level (VIXY proxy), a linear-
-                                          regression fear/vol combiner, and
-                                          option chain lookup
+                                          ATR/trend), realized beta, compact
+                                          whole-portfolio snapshot, plus optional tools
     alpaca_orders_mcp_server.py          MCP server 2: whole-portfolio order
                                           batch, options hedge orders,
                                           account/positions
 crew/
-    trading_crew.py                      MCP client — 6-agent crew, one
-                                          run_one_cycle() = one full pass
+    trading_crew.py                      MCP client — one-inference decision
+                                          pass with deterministic pre/post-processing
     logging_utils.py                     agentNameDDMMYYYY-HH:MM.md logging
                                           + "load yesterday's report" helper
 scripts/
@@ -61,9 +58,7 @@ cp .env.example .env              # fill in YOUR OWN keys
 cp config/config.example.yaml config/<your_name>.yaml   # edit your stock list
 ```
 
-In the Alpaca dashboard, confirm **options trading is enabled** on your
-paper account (needed for the hedge leg) — Settings → Options Trading →
-request Level 1 or 2 approval. This is instant on paper accounts.
+The example config has options hedging disabled to keep the default run compact and reliable. If you deliberately enable `hedging.enabled` for a later experiment, confirm options trading is available on your Alpaca paper account before relying on the hedge leg.
 
 ## Test a single cycle (no need to sit through the whole window)
 
@@ -72,7 +67,7 @@ cd scripts
 python run_session.py --config ../config/<your_name>.yaml --once
 ```
 
-Check `logs/<DDMMYYYY>/` for the five agent output files afterward.
+Check `logs/<DDMMYYYY>/` for four stage logs: data fetch, technical snapshot, decisions, and execution.
 
 ## Run the real session
 
@@ -83,56 +78,37 @@ python run_session.py --config ../config/<your_name>.yaml
 
 Start this around 7:00pm IST (9:30am ET). It loops every
 `session.cycle_interval_minutes` (default 30) until 1:30am IST (4:00pm
-ET), re-running the whole crew each cycle, logging every agent's output,
-and feeding the prior cycle's decision-maker report back in as context —
-that's the improve-as-we-go loop. A daily-loss circuit breaker
+ET), re-running the compact cycle each interval and logging its four stages. Earlier verbose reports are not re-fed to Groq. A daily-loss circuit breaker
 (`risk.daily_loss_stop_pct`) blocks new positions (not the hedge) if the
 account drops too far intraday.
 
-## Volatility & fear regression agent
+## Compact Groq workflow
 
-Sits between the Technical Analyst and the Hedging Agent in the crew. For
-every symbol it computes:
+The default cycle makes one LLM inference. Python calls the batched OHLCV fetch,
+computes technical indicators and realized beta for the whole portfolio through one
+compact local tool, retrieves current paper-account positions/cash, then sends a
+small JSON snapshot to Groq. The returned decisions are validated locally and submitted
+in one batch to the paper-order server. It does not ask an LLM to call MCP tools.
 
-- **Realized volatility (RV)** — annualized stdev of daily log returns
-  (`calculate_realized_volatility`).
-- **Implied volatility (IV)** — read directly from Alpaca's option
-  snapshot endpoint for the nearest at-the-money contract
-  (`get_iv_metrics`; Alpaca computes IV/greeks itself via Black-Scholes,
-  this tool just reads those fields rather than re-deriving them).
-- **IV-RV spread** — a wide positive spread (IV well above RV) means the
-  options market is pricing in more future movement than has actually
-  occurred: a classic sign the market senses an event or elevated risk
-  ahead.
-- **Market-wide fear level** — via VIXY (a VIX-futures ETF), since Alpaca
-  only serves equities/ETPs and doesn't carry the real CBOE VIX index
-  (`get_market_volatility`).
-- **`fear_adjusted_signal`** — a single combined number per symbol from
-  `calculate_fear_regression`: an in-sample OLS linear regression (via
-  scikit-learn) of next-day return on realized vol, RSI, relative volume
-  and market-fear-change, with the IV-RV spread applied as a post-fit
-  adjustment. **Read the docstring on that function before trusting it**
-  — with ~60 data points and a handful of features this is a transparent
-  way to combine signals with sensible weights, not a validated
-  forecasting model. The tool reports `fit_r_squared` for exactly this
-  reason; below ~0.15 the decision-maker is instructed to treat the
-  reading as noise.
+The default example config uses `groq/openai/gpt-oss-20b`, a 1,200-token
+completion ceiling, 120 calendar days of OHLCV data, a 60-trading-day beta
+window, and options hedging disabled. These values reduce prompt size; the actual
+Groq limits depend on the account plan/model and can change.
 
-This agent's output feeds two places: the Hedging Agent leans toward
-more hedge contracts (within the premium cap) when market fear is
-`Elevated`, and the Decision-Maker treats a Fear-leaning signal as a
-reason to size down or wait on an otherwise-bullish name — one input
-among several, never a standalone trigger.
+The server-side paper-trading and risk guards remain authoritative. The order
+server is pinned to Alpaca paper mode and independently checks position limits,
+cash buffer, confidence, trade frequency, halt flag, and hedge limits if hedging
+is explicitly enabled in a personal config. Do not switch `paper=True` to live
+trading. Optional regression and options tools remain in the MCP server for
+future experimentation but are not part of the compact default run.
 
 ## Safety model — read before any live run
 
-Every `risk.*` and `hedging.*` limit in your config is enforced **twice**:
-once as an instruction in the decision-maker agent's prompt, and
-independently again, server-side, in `alpaca_orders_mcp_server.py` —
-against LIVE Alpaca account data, not whatever the agent's JSON claims.
-The second layer is the one that actually matters; the first is just
-there so the agent doesn't waste cycles proposing trades it knows will be
-rejected. Concretely, before any order reaches Alpaca:
+The decision prompt includes the configured risk limits. Python then validates model output
+against current Alpaca paper-account cash, positions, confidence, sizing and the daily halt state.
+The `alpaca_orders_mcp_server.py` independently applies its own configured checks immediately
+before orders are submitted. No LLM output is trusted as a final order instruction. Concretely,
+before an order reaches Alpaca:
 
 - `action` is matched against an explicit `buy`/`sell`/`hold` allow-list —
   anything else is rejected outright, never silently treated as a sell.
@@ -152,11 +128,9 @@ rejected. Concretely, before any order reaches Alpaca:
   regardless of which script is driving. `--once` is gated by this exactly
   the same way the live loop is; there's no bypass path anymore.
 
-Call the `get_safety_status` tool (via the MCP inspector, or ask the crew
-to call it) anytime to see current halt state, the limits actually being
-applied, and today's trade counts — useful when a run produces fewer
-trades than you expected and you want to know whether that's the agents
-being cautious or a limit kicking in.
+The compact cycle writes a safety snapshot into its execution-stage log. You can also call
+`get_safety_status` via an MCP inspector to see the current halt state, limits applied and
+today's per-symbol ledger when investigating a run with fewer trades than expected.
 
 ## What's not built yet
 

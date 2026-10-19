@@ -1,59 +1,19 @@
 """
-trading_crew.py
-----------------
-MCP CLIENT — portfolio-level CrewAI trading crew.
+Low-token, single-inference portfolio trader for Groq + local MCP servers.
 
-Rebuilt from the class starter trading_crew.py / trading_crew_1.py for a
-WHOLE-PORTFOLIO run (15 stocks at once, not one ticker per invocation),
-with a hedging agent, a volatility/implied-volatility "fear" regression
-agent, and a daily self-improvement loop layered on top.
-
-Six agents run in sequence each cycle:
-    1. Data Fetcher          — batched OHLCV + VIXY (market fear proxy)
-    2. Technical Analyst     — RSI/MACD/Bollinger/beta cross-section
-    3. Volatility/Fear Agent — realized vol vs implied vol, market-wide
-                                fear level, and a linear-regression model
-                                that combines IV-RV spread, realized vol,
-                                relative volume, RSI and market fear into
-                                ONE fear_adjusted_signal per symbol (see
-                                calculate_fear_regression in
-                                technical_indicators_mcp_server.py for the
-                                full math + honest caveats about what an
-                                in-sample OLS fit can and can't tell you)
-    4. Hedging Agent         — sizes the SPY/QQQ tail hedge, leaning on
-                                both portfolio beta AND the fear agent's
-                                market-wide reading
-    5. Decision-Maker        — final buy/sell/hold + sizing, weighing
-                                technicals, the fear signal, and the hedge
-    6. Execution Agent       — submits the batch (independently
-                                re-validated server-side, see
-                                alpaca_orders_mcp_server.py)
-
-Prerequisites
--------------
-    pip install -r ../requirements.txt
-    export GROQ_API_KEY="your_groq_key"        # free tier: console.groq.com
-    export ALPACA_API_KEY="your_OWN_paper_key"  # do NOT reuse the key leaked
-    export ALPACA_SECRET_KEY="your_OWN_paper_secret"  # in the class file comment
-
-Usage
------
-    python trading_crew.py --config ../config/aman.yaml
-
-One call to run() = one full cycle (fetch -> analyze -> hedge -> decide ->
-execute -> log). scripts/run_session.py wraps this in the 9:30am-4:00pm ET
-loop; this file itself runs exactly once per invocation, which also makes
-it easy to test on a single cycle without sitting through the whole window.
+Data fetching and indicator calculations run deterministically in Python/MCP.
+Groq receives one compact portfolio snapshot and returns one JSON decision set.
+Python validates that output and submits one batch to Alpaca PAPER trading.
+The independent order server remains the final authority for risk checks.
 """
+from __future__ import annotations
 
-# ============================================================
-# 0.0 Imports
-# ============================================================
 import argparse
 import json
 import os
+import re
 import sys
-from pathlib import Path
+from typing import Any
 
 import yaml
 from crewai import Agent, Task, Crew, Process, LLM
@@ -61,7 +21,7 @@ from crewai_tools import MCPServerAdapter
 from mcp import StdioServerParameters
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from logging_utils import save_agent_log, load_previous_decision_report
+from logging_utils import save_agent_log
 
 SERVERS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..",
@@ -69,416 +29,412 @@ SERVERS_DIR = os.path.join(
 )
 
 
-# ============================================================
-# 1.0 Config loading
-# ============================================================
 def load_config(path: str) -> dict:
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+    with open(path, "r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
 
 
-# ============================================================
-# 2.0 Build the crew for one cycle
-# ============================================================
-def build_crew(cfg: dict, mcp_tools: list, yesterday_report: str | None):
-    symbols = [s["symbol"] for s in cfg["portfolio"]["stocks"]]
-    capital = cfg["portfolio"]["starting_capital"]
+def _tool_name(tool: Any) -> str:
+    name = getattr(tool, "name", None) or getattr(tool, "tool_name", None) or ""
+    return str(name).rsplit("__", 1)[-1].rsplit("/", 1)[-1]
+
+
+def tools_for(all_tools: list, *wanted_names: str) -> dict[str, Any]:
+    """Find only the expected tools, including server-prefixed MCP names."""
+    found = {}
+    names = [(tool, _tool_name(tool)) for tool in all_tools]
+    for wanted in wanted_names:
+        matches = [tool for tool, name in names if name == wanted]
+        if not matches:
+            matches = [
+                tool for tool, name in names
+                if name.endswith("_" + wanted) or name.endswith("__" + wanted)
+            ]
+        if len(matches) != 1:
+            available = sorted(name for _, name in names)
+            raise RuntimeError(
+                f"Expected one MCP tool named {wanted!r}; found {len(matches)}. "
+                f"Available tools: {available}"
+            )
+        found[wanted] = matches[0]
+    return found
+
+
+def _invoke_tool(tool: Any, arguments: dict) -> Any:
+    """Call a CrewAI MCP tool directly without spending an LLM turn."""
+    # CrewAIToolAdapter creates BaseTool subclasses whose _run signature is
+    # keyword-only, so use run(**arguments), not run(arguments).
+    if hasattr(tool, "run"):
+        return tool.run(**arguments)
+    if hasattr(tool, "invoke"):
+        return tool.invoke(arguments)
+    raise TypeError(f"MCP tool {_tool_name(tool)!r} has no run/invoke method")
+
+
+def _as_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    # MCP wrappers may return an object with textual content blocks.
+    content = getattr(value, "content", None)
+    if content:
+        for item in content:
+            item_text = getattr(item, "text", None)
+            if item_text:
+                try:
+                    parsed = json.loads(item_text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+    return {"raw": str(value)}
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        return result if result == result and abs(result) != float("inf") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_json_object(raw: str) -> dict:
+    """Accept plain JSON or a fenced JSON object, but never guess a decision."""
+    text = str(raw).strip()
+    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```\s*$", "", text)
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("decisions"), list):
+            return value
+    raise ValueError("Groq did not return a valid JSON object with a decisions list")
+
+
+def _compact_snapshot(snapshot: dict) -> dict:
+    """Whitelist fields so unexpected tool payloads cannot inflate the prompt."""
+    rows = []
+    for row in snapshot.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        rows.append({
+            "symbol": str(row.get("symbol", "")).upper(),
+            "close": row.get("close"),
+            "rsi": row.get("rsi"),
+            "rsi_signal": row.get("rsi_signal"),
+            "macd": row.get("macd"),
+            "bb_percent_b": row.get("bb_percent_b"),
+            "trend": row.get("trend"),
+            "relative_volume": row.get("relative_volume"),
+            "beta": row.get("beta"),
+            "beta_class": row.get("beta_class"),
+        })
+    return {
+        "status": snapshot.get("status", "unknown"),
+        "equal_weight_average_beta": snapshot.get("equal_weight_average_beta"),
+        "rows": rows,
+        "missing": [
+            {"symbol": str(item.get("symbol", "")).upper(),
+             "error": str(item.get("error", ""))[:100]}
+            for item in snapshot.get("missing", [])[:15]
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _compact_positions(positions: dict, allowed_symbols: list[str]) -> dict:
+    allowed = set(allowed_symbols)
+    compact = {}
+    for position in positions.get("positions", []):
+        if not isinstance(position, dict):
+            continue
+        symbol = str(position.get("symbol", "")).upper()
+        if symbol in allowed:
+            compact[symbol] = {
+                "qty": _number(position.get("qty")),
+                "market_value": round(_number(position.get("market_value")), 2),
+            }
+    return compact
+
+
+def _normalize_decisions(
+    model_output: str,
+    symbols: list[str],
+    cfg: dict,
+    account: dict,
+    positions: dict,
+    trading_halted: bool = False,
+) -> tuple[list[dict], list[str]]:
+    """
+    Fail closed on invalid output, unknown symbols and malformed trades.
+    Locally applies position and cash caps before the server's own checks.
+    """
+    notes: list[str] = []
+    try:
+        parsed = _extract_json_object(model_output)
+    except ValueError as exc:
+        notes.append(str(exc) + "; submitted HOLD for all symbols.")
+        return [
+            {"symbol": symbol, "action": "hold", "notional": 0.0, "confidence": 0.0}
+            for symbol in symbols
+        ], notes
+
+    by_symbol = {}
+    for item in parsed["decisions"]:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol", "")).upper().strip()
+        if symbol not in symbols or symbol in by_symbol:
+            notes.append(f"Ignored unknown/duplicate symbol: {symbol or '(blank)'}")
+            continue
+        by_symbol[symbol] = item
+
+    limits = cfg.get("risk", {})
+    equity = _number(account.get("portfolio_value"), _number(account.get("equity"), cfg["portfolio"]["starting_capital"]))
+    cash = _number(account.get("cash"))
+    position_cap = max(0.0, equity * _number(limits.get("max_position_weight_pct", 10)) / 100)
+    cash_floor = max(0.0, equity * _number(limits.get("min_cash_buffer_pct", 10)) / 100)
+    buy_capacity = max(0.0, cash - cash_floor)
+    confidence_floor = _number(limits.get("min_confidence_to_trade", 0.65))
+    # The server independently checks its on-disk daily trade ledger every call.
+
+    normalized = []
+    positions_by_symbol = positions
+    for symbol in symbols:
+        item = by_symbol.get(symbol, {})
+        action = str(item.get("action", "hold")).lower().strip()
+        confidence = _number(item.get("confidence"), 0.0)
+        notional = _number(item.get("notional"), 0.0)
+        if action not in {"buy", "sell", "hold"}:
+            notes.append(f"{symbol}: invalid action converted to hold")
+            action = "hold"
+        if confidence < 0 or confidence > 1:
+            notes.append(f"{symbol}: invalid confidence converted to hold")
+            action = "hold"
+        if action == "buy":
+            if trading_halted:
+                notes.append(f"{symbol}: trading halt active; buy converted to hold")
+                action = "hold"
+            elif confidence < confidence_floor:
+                notes.append(f"{symbol}: buy below confidence threshold converted to hold")
+                action = "hold"
+            elif notional <= 0:
+                notes.append(f"{symbol}: buy with invalid notional converted to hold")
+                action = "hold"
+            else:
+                existing_value = max(0.0, _number(positions_by_symbol.get(symbol, {}).get("market_value")))
+                position_headroom = max(0.0, position_cap - existing_value)
+                proposed = notional
+                notional = min(notional, position_headroom, buy_capacity)
+                if notional < proposed:
+                    notes.append(f"{symbol}: buy size reduced to position/cash headroom")
+                if notional < 1.0:
+                    notes.append(f"{symbol}: insufficient cash after buffer; hold")
+                    action = "hold"
+                else:
+                    buy_capacity -= notional
+        elif action == "sell":
+            held = positions_by_symbol.get(symbol, {})
+            available_market_value = max(0.0, _number(held.get("market_value")))
+            if available_market_value < 1.0:
+                notes.append(f"{symbol}: sell without a long position converted to hold")
+                action = "hold"
+            elif notional <= 0:
+                # Default to closing the long position; selling cannot exceed holdings.
+                notional = available_market_value
+            else:
+                notional = min(notional, available_market_value)
+            if notional < 1.0:
+                action = "hold"
+        if action == "hold":
+            notional = 0.0
+        normalized.append({
+            "symbol": symbol,
+            "action": action,
+            "notional": round(notional, 2),
+            "confidence": round(confidence, 3),
+        })
+    return normalized, notes
+
+
+def _decision_task_description(cfg: dict, snapshot: dict, account: dict, positions: dict, trading_halted: bool = False) -> str:
+    symbols = [str(item["symbol"]).upper() for item in cfg["portfolio"]["stocks"]]
     risk = cfg["risk"]
-    hedging = cfg["hedging"]
-    data_cfg = cfg["data"]
-    # volatility.* is optional in config.yaml — default to sane values so
-    # existing configs (aman/mayank/aditi.yaml) don't need editing to pick
-    # up this new agent.
-    volatility_cfg = cfg.get("volatility", {})
-    fear_window_days = volatility_cfg.get("fear_regression_window_days", 60)
-
-    llm = LLM(
-        model=cfg["llm"]["model"],
-        api_key=os.environ.get("GROQ_API_KEY", ""),
-        temperature=cfg["llm"].get("temperature", 0.2),
+    portfolio_value = _number(account.get("portfolio_value"), _number(account.get("equity"), cfg["portfolio"]["starting_capital"]))
+    cash = _number(account.get("cash"))
+    max_position = portfolio_value * _number(risk.get("max_position_weight_pct", 10)) / 100
+    cash_floor = portfolio_value * _number(risk.get("min_cash_buffer_pct", 10)) / 100
+    context = {
+        "symbols": symbols,
+        "account": {"portfolio_value": round(portfolio_value, 2), "cash": round(cash, 2)},
+        "positions": positions,
+        "limits": {
+            "max_position_dollars": round(max_position, 2),
+            "minimum_cash_dollars": round(cash_floor, 2),
+            "min_confidence_to_trade": risk["min_confidence_to_trade"],
+            "max_trades_per_symbol_per_day": risk["max_trades_per_symbol_per_day"],
+        },
+        "market_snapshot": snapshot,
+        "trading_halted": bool(trading_halted),
+    }
+    description = (
+        "You are making one conservative decision pass for an Alpaca PAPER account. "
+        "Use only the supplied snapshot and current positions. Do not invent prices or data. "
+        "Choose BUY only with a coherent bullish setup (up trend, bullish MACD crossover, "
+        "RSI generally 35-68, and no obvious contradiction). Choose SELL only to reduce an "
+        "existing long position when the setup is bearish (down trend or bearish MACD). "
+        "Otherwise choose HOLD. Never short, never propose options, and never use leverage. "
+        "Use confidence from 0 to 1. BUY confidence must meet the configured threshold. "
+        "Each order notional must be positive and no greater than max_position_dollars; total "
+        "buys must leave the minimum cash reserve intact. Python and the paper-order server "
+        "will enforce these limits again. Prefer HOLD when signals or data are missing. "
+        "Limit each reason to 8 words. Return only valid JSON (no markdown, no extra text) "
+        "in this exact shape: {\"decisions\":[{\"symbol\":\"AAPL\",\"action\":\"hold\","
+        "\"notional\":0,\"confidence\":0.5,\"reason\":\"mixed signals\"}]}. Include exactly "
+        "one entry for every supplied symbol; allowed actions are buy, sell, hold.\n\n"
+        "DATA:\n" + json.dumps(context, separators=(",", ":"), ensure_ascii=True)
     )
-
-    # ------------------------------------------------------------
-    # 2.1 Agents
-    # ------------------------------------------------------------
-    data_fetcher_agent = Agent(
-        role="Portfolio Data Fetcher",
-        goal=(
-            f"Fetch {data_cfg['lookback_days']} days of OHLCV data for the "
-            f"ENTIRE portfolio ({', '.join(symbols)}) plus the SPY benchmark "
-            "in a single batched call, so no downstream agent ever makes a "
-            "per-symbol data request."
-        ),
-        backstory=(
-            "You are a market-data specialist. You know repeated per-ticker "
-            "API calls are slow and risk rate limits, so you always batch."
-        ),
-        tools=mcp_tools,
-        llm=llm,
-        verbose=True,
-    )
-
-    technical_analyst_agent = Agent(
-        role="Portfolio Technical Analyst",
-        goal=(
-            f"For EVERY symbol in {symbols}, call calculate_indicators and "
-            "calculate_beta. Produce one consolidated cross-sectional table "
-            "(not 15 separate reports) covering RSI, MACD, Bollinger %b, "
-            "ATR, trend, relative volume, and realized beta for each stock, "
-            "plus the portfolio's capital-weighted average beta assuming an "
-            "equal-weight starting allocation."
-        ),
-        backstory=(
-            "You are a quantitative analyst. You think in cross-sections, "
-            "not single-stock stories — your job is to rank the whole book "
-            "against itself, not analyze one ticker in isolation."
-        ),
-        tools=mcp_tools,
-        llm=llm,
-        verbose=True,
-    )
-
-    volatility_fear_agent = Agent(
-        role="Volatility and Fear Regression Analyst",
-        goal=(
-            f"For EVERY symbol in {symbols}, call calculate_realized_volatility, "
-            f"get_iv_metrics, and calculate_fear_regression (window_days={fear_window_days}), "
-            "plus ONE call to get_market_volatility for the whole-market fear "
-            "level (do not call get_market_volatility per symbol — it's "
-            "market-wide, call it once). For each symbol report: realized "
-            "volatility, implied volatility (and the IV-RV spread — a wide "
-            "positive spread means the options market is pricing in more "
-            "future movement than has actually occurred, a classic sign the "
-            "market senses an event or elevated risk ahead), the regression's "
-            "fear_adjusted_signal and its interpretation, and the fit's R² "
-            "(explicitly flag any symbol where fit_r_squared is below 0.15 as "
-            "LOW CONFIDENCE — that reading should carry little weight). Open "
-            "with the overall market fear_level from get_market_volatility so "
-            "the rest of the crew has that context before anything else."
-        ),
-        backstory=(
-            "You are a volatility and derivatives-pricing specialist. You "
-            "think of implied volatility as the options market's own forecast "
-            "of future movement, and you compare it against what actually "
-            "happened (realized volatility) to gauge whether fear is being "
-            "priced in ahead of an event. You are honest about your own "
-            "model's limits — an in-sample linear regression over a short "
-            "window is a way to combine signals transparently, not a proven "
-            "forecast, and you say so plainly rather than overstating "
-            "confidence in a low-R² reading."
-        ),
-        tools=mcp_tools,
-        llm=llm,
-        verbose=True,
-    )
-
-    hedging_agent = Agent(
-        role="Hedging and Risk Overlay Agent",
-        goal=(
-            f"Using the portfolio's weighted average beta from the technical "
-            f"analyst AND the market-wide fear_level from the volatility "
-            f"analyst, and {hedging['instrument']} option chain data, size a "
-            f"tail-hedge ({hedging['option_type']} options) that covers "
-            f"roughly {hedging['target_hedge_ratio']*100:.0f}% of the "
-            f"portfolio's beta-weighted dollar exposure under normal "
-            f"conditions — but lean toward the TOP of that range (more "
-            f"contracts, within the premium cap) when the volatility "
-            f"analyst's market fear_level is 'Elevated', and toward the "
-            f"bottom of the range when it is 'Complacent'. Cap total premium "
-            f"spend at {hedging['max_hedge_cost_pct_of_portfolio']}% of "
-            f"portfolio value regardless of fear level — never breach the cap "
-            f"just because fear is high. State: underlying, strike, expiry, "
-            f"contract count, estimated premium cost, how the market fear "
-            f"level influenced sizing, and what this hedge does and does NOT "
-            f"protect against (it will not offset single-stock idiosyncratic "
-            f"risk, only broad market moves)."
-        ),
-        backstory=(
-            "You are a derivatives risk manager. Your job is capital "
-            "preservation during tail events, not return-chasing — you are "
-            "deliberately the most conservative voice on this team, same "
-            "role a risk desk plays at a real trading firm. You take the "
-            "volatility analyst's market fear reading seriously: options "
-            "pricing in more fear than usual is exactly the condition a tail "
-            "hedge exists for."
-        ),
-        tools=mcp_tools,
-        llm=llm,
-        verbose=True,
-    )
-
-    decision_maker_agent = Agent(
-        role="Portfolio Decision-Maker",
-        goal=(
-            f"Given the technical analyst's cross-sectional table, the "
-            f"volatility analyst's per-symbol fear_adjusted_signal and "
-            f"market-wide fear_level, and the hedging agent's overlay "
-            f"recommendation{' and YESTERDAY-S RESULTS below' if yesterday_report else ''}, "
-            f"treat the fear_adjusted_signal as ONE additional input alongside "
-            f"the technical indicators — not a standalone trigger, and give "
-            f"little weight to any symbol's reading where the volatility "
-            f"analyst flagged LOW CONFIDENCE (fit_r_squared < 0.15). A "
-            f"Fear-leaning reading on a symbol you were otherwise bullish on "
-            f"is a reason to size down or wait, not necessarily to flip to sell. "
-            f"decide buy/sell/hold AND a dollar amount for EVERY symbol in "
-            f"{symbols} simultaneously, allocating against a ${capital:,.0f} "
-            f"starting capital base. Hard rules you MUST follow: "
-            f"(1) no single position may exceed {risk['max_position_weight_pct']}% "
-            f"of portfolio value, "
-            f"(2) keep at least {risk['min_cash_buffer_pct']}% of capital as cash, "
-            f"(3) state a confidence score 0-1 per decision; if confidence < "
-            f"{risk['min_confidence_to_trade']}, the decision MUST be hold, "
-            f"(4) do not recommend more than {risk['max_trades_per_symbol_per_day']} "
-            f"trade(s) per symbol in this cycle — no flip-flopping a position "
-            f"within the same session, "
-            f"(5) factor in the hedging agent's overlay cost when sizing "
-            f"equity positions so total capital usage (equities + hedge "
-            f"premium) never exceeds available capital. "
-            f"Your final output MUST end with a fenced JSON code block of "
-            f"the exact shape: "
-            f'{{"decisions": [{{"symbol": "...", "action": "buy|sell|hold", '
-            f'"notional": 0.0, "confidence": 0.0, "reason": "..."}}], '
-            f'"hedge": {{"underlying": "...", "option_symbol": "...", '
-            f'"contracts": 0, "reason": "..."}}}} '
-            f"— this block is machine-parsed to trigger execution, so the "
-            f"JSON must be syntactically valid and nothing else may follow it."
-        ),
-        backstory=(
-            "You are the senior portfolio manager who makes the final call. "
-            "You weigh the quant signals against the risk desk's hedge "
-            "recommendation and, when available, your own team's results "
-            "from the prior session — you adjust sizing and conviction based "
-            "on what actually worked yesterday, not just today's raw signals."
-        ),
-        tools=[],
-        llm=llm,
-        verbose=True,
-    )
-
-    execution_agent = Agent(
-        role="Portfolio Execution Agent",
-        goal=(
-            "Parse the decision-maker's final JSON block. Call "
-            "place_portfolio_orders ONCE with the full `decisions` list "
-            "(skip entries where action is 'hold' — the tool handles this, "
-            "but never call it per-symbol). If `hedge.contracts` > 0 and "
-            "hedging is enabled, separately call buy_option_hedge with the "
-            "hedge's option_symbol and contracts. Report a clean execution "
-            "summary: how many buys/sells/holds, and the hedge order result."
-        ),
-        backstory=(
-            "You are a disciplined execution specialist. You execute "
-            "exactly what the decision-maker approved — no more, no less — "
-            "and you always submit the equity batch as a single call."
-        ),
-        tools=mcp_tools,
-        llm=llm,
-        verbose=True,
-    )
-
-    # ------------------------------------------------------------
-    # 2.2 Tasks
-    # ------------------------------------------------------------
-    task_fetch = Task(
-        description=(
-            f"Call fetch_ohlcv_batch ONCE with symbols={symbols}, "
-            f"lookback_days={data_cfg['lookback_days']}, "
-            f"timeframe='{data_cfg['timeframe']}', include_benchmark=True, "
-            f"include_market_fear_proxy=True. Confirm every symbol was "
-            "cached successfully; flag any that came back missing."
-        ),
-        expected_output="Per-symbol bar counts and date range; list of any missing symbols.",
-        agent=data_fetcher_agent,
-    )
-
-    task_analyze = Task(
-        description=(
-            f"For every symbol in {symbols}, call calculate_indicators and "
-            f"calculate_beta (window_days={data_cfg['beta_window_days']}). "
-            "Build one markdown table with columns: Symbol, Close, RSI, "
-            "MACD Crossover, Bollinger %b, Trend, Relative Volume, Beta, "
-            "Beta Class. Add a closing line stating the portfolio's "
-            "capital-weighted average beta (equal-weight assumption)."
-        ),
-        expected_output="One consolidated cross-sectional markdown table plus the weighted average beta.",
-        agent=technical_analyst_agent,
-        context=[task_fetch],
-    )
-
-    task_volatility_fear = Task(
-        description=(
-            f"Call get_market_volatility ONCE for the market-wide fear "
-            f"level. Then for every symbol in {symbols}, call "
-            f"calculate_realized_volatility, get_iv_metrics, and "
-            f"calculate_fear_regression (window_days={fear_window_days}). "
-            "Build one consolidated table: Symbol, Realized Vol, Implied "
-            "Vol, IV-RV Spread, Fear-Adjusted Signal, Interpretation, R², "
-            "Confidence. Open with the market-wide fear_level and "
-            "percentile_rank. Clearly flag any symbol where IV data was "
-            "unavailable (iv_available: false) — this is expected if "
-            "options aren't enabled yet or a ticker has no listed options; "
-            "don't treat it as an error, just note the regression ran "
-            "without the IV-RV term for that symbol."
-        ),
-        expected_output=(
-            "Market-wide fear_level/percentile_rank, followed by one "
-            "consolidated per-symbol volatility/fear table."
-        ),
-        agent=volatility_fear_agent,
-        context=[task_fetch],
-    )
-
-    task_hedge = Task(
-        description=(
-            f"Using the technical analyst's weighted average beta AND the "
-            f"volatility analyst's market-wide fear_level, call "
-            f"get_option_chain for underlying='{hedging['instrument']}', "
-            f"option_type='{hedging['option_type']}', "
-            f"max_expiration_days={hedging['max_expiration_days']}. "
-            "Pick a near-the-money strike and a short-dated expiry inside "
-            "that window, size the contract count to cover roughly "
-            f"{hedging['target_hedge_ratio']*100:.0f}% of the portfolio's "
-            f"beta-weighted dollar exposure (lean toward more contracts, "
-            f"within the cap, if fear_level is 'Elevated'; fewer if "
-            f"'Complacent'), and keep total estimated premium under "
-            f"{hedging['max_hedge_cost_pct_of_portfolio']}% of ${capital:,.0f} "
-            f"NO MATTER the fear level. If hedging.enabled is False or no "
-            "suitable contract is found, explicitly recommend hedge "
-            "contracts=0 and say why."
-        ),
-        expected_output=(
-            "A hedge recommendation stating underlying, option_symbol, "
-            "strike, expiry, contracts, estimated premium, how market fear "
-            "level influenced sizing, and limitations."
-        ),
-        agent=hedging_agent,
-        context=[task_analyze, task_volatility_fear],
-    )
-
-    decision_context = [task_analyze, task_volatility_fear, task_hedge]
-    yesterday_note = ""
-    if yesterday_report:
-        yesterday_note = (
-            "\n\nYESTERDAY'S RESULTS (your own team's prior decision log — "
-            "use this to adjust conviction/sizing, e.g. cut size on symbols "
-            "that underperformed their signal, raise conviction where the "
-            "signal played out as expected):\n\n" + yesterday_report
-        )
-
-    task_decide = Task(
-        description=(
-            "Synthesize the technical analyst's table and the hedging "
-            "agent's recommendation into final per-symbol decisions plus "
-            "the hedge order, following every hard rule in your goal. "
-            + yesterday_note
-        ),
-        expected_output=(
-            "A short rationale section, followed by the required fenced "
-            "JSON block (decisions + hedge) as the very last thing in your output."
-        ),
-        agent=decision_maker_agent,
-        context=decision_context,
-    )
-
-    task_execute = Task(
-        description=(
-            "Extract the JSON block from the decision-maker's output. Call "
-            "place_portfolio_orders with its `decisions` list. If hedging "
-            f"is enabled ({hedging['enabled']}) and hedge.contracts > 0, "
-            "also call buy_option_hedge. Summarize what was executed."
-        ),
-        expected_output="Execution summary: buy/sell/hold counts, order results, hedge order result.",
-        agent=execution_agent,
-        context=[task_decide],
-    )
-
-    crew = Crew(
-        agents=[
-            data_fetcher_agent, technical_analyst_agent, volatility_fear_agent,
-            hedging_agent, decision_maker_agent, execution_agent,
-        ],
-        tasks=[
-            task_fetch, task_analyze, task_volatility_fear, task_hedge,
-            task_decide, task_execute,
-        ],
-        process=Process.sequential,
-        verbose=True,
-    )
-
-    agent_task_pairs = [
-        ("PortfolioDataFetcher", task_fetch),
-        ("PortfolioTechnicalAnalyst", task_analyze),
-        ("VolatilityFearAnalyst", task_volatility_fear),
-        ("HedgingRiskAgent", task_hedge),
-        ("PortfolioDecisionMaker", task_decide),
-        ("PortfolioExecutionAgent", task_execute),
-    ]
-
-    return crew, agent_task_pairs
+    return description
 
 
-# ============================================================
-# 3.0 Run one cycle
-# ============================================================
 def run_one_cycle(config_path: str):
     cfg = load_config(config_path)
+    symbols = [str(item["symbol"]).upper() for item in cfg["portfolio"]["stocks"]]
     log_dir = cfg["logs"]["run_dir"]
-
-    # The orders server independently re-enforces risk.* and hedging.*
-    # from config.yaml rather than trusting the agent's own arithmetic —
-    # it needs the config path and an ABSOLUTE log dir (so its halt-file
-    # and trade-ledger paths resolve the same way regardless of the
-    # subprocess's working directory) to do that. See the big docstring
-    # at the top of alpaca_orders_mcp_server.py for why this exists.
     server_env = {
         **os.environ,
         "TRADING_CONFIG_PATH": os.path.abspath(config_path),
         "TRADING_LOG_DIR": os.path.abspath(log_dir),
     }
-
     indicators_server = StdioServerParameters(
-        command="python",
+        command=sys.executable,
         args=[os.path.join(SERVERS_DIR, "technical_indicators_mcp_server.py")],
         env=server_env,
     )
     orders_server = StdioServerParameters(
-        command="python",
+        command=sys.executable,
         args=[os.path.join(SERVERS_DIR, "alpaca_orders_mcp_server.py")],
         env=server_env,
     )
 
-    # Connects to BOTH local MCP servers at once; mcp_tools ends up as the
-    # union of both servers' tools (fetch/indicators/beta/options-chain
-    # from server 1, order placement from server 2).
     with MCPServerAdapter([indicators_server, orders_server]) as mcp_tools:
-        yesterday_report = load_previous_decision_report(log_dir)
+        selected = tools_for(
+            mcp_tools,
+            "fetch_ohlcv_batch",
+            "calculate_portfolio_snapshot",
+            "get_all_positions",
+            "get_account_info",
+            "get_safety_status",
+            "place_portfolio_orders",
+        )
+        data_cfg = cfg["data"]
+        # Data calls are direct MCP invocations, not LLM tool calls.
+        fetch_result = _as_dict(_invoke_tool(selected["fetch_ohlcv_batch"], {
+            "symbols": symbols,
+            "lookback_days": int(data_cfg.get("lookback_days", 120)),
+            "timeframe": data_cfg.get("timeframe", "1Day"),
+            "include_benchmark": True,
+            "include_market_fear_proxy": False,
+        }))
+        if fetch_result.get("status") not in {"ok", "partial"}:
+            raise RuntimeError(f"OHLCV fetch failed; refusing to ask the model to trade: {fetch_result}")
+        snapshot_raw = _as_dict(_invoke_tool(selected["calculate_portfolio_snapshot"], {
+            "symbols": symbols,
+            "beta_window_days": int(data_cfg.get("beta_window_days", 60)),
+        }))
+        snapshot = _compact_snapshot(snapshot_raw)
+        account = _as_dict(_invoke_tool(selected["get_account_info"], {}))
+        positions_raw = _as_dict(_invoke_tool(selected["get_all_positions"], {}))
+        safety = _as_dict(_invoke_tool(selected["get_safety_status"], {}))
+        if "raw" in account or "cash" not in account or not ("portfolio_value" in account or "equity" in account):
+            raise RuntimeError("Could not verify current paper-account cash/equity; refusing to trade.")
+        if "raw" in positions_raw or not isinstance(positions_raw.get("positions"), list):
+            raise RuntimeError("Could not verify open positions; refusing to trade.")
+        positions = _compact_positions(positions_raw, symbols)
+        if account.get("account_blocked") or account.get("trading_blocked"):
+            raise RuntimeError("Alpaca reports the paper account is blocked; no decisions or orders were submitted.")
 
-        crew, agent_task_pairs = build_crew(cfg, mcp_tools, yesterday_report)
+        trading_halted = bool(safety.get("halted", True))
+        llm_cfg = cfg["llm"]
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY is not set. Add your Groq key to .env.")
+        llm = LLM(
+            model=llm_cfg["model"],
+            api_key=api_key,
+            temperature=float(llm_cfg.get("temperature", 0.1)),
+            max_tokens=int(llm_cfg.get("max_tokens", 1200)),
+        )
+        decision_agent = Agent(
+            role="Compact Portfolio Decision-Maker",
+            goal="Return a single compact JSON portfolio decision set based on provided numeric evidence.",
+            backstory="You are conservative, evidence-based and operate on an Alpaca PAPER account. Missing or contradictory data means HOLD.",
+            llm=llm,
+            verbose=False,
+            max_iter=1,
+            allow_delegation=False,
+        )
+        task = Task(
+            description=_decision_task_description(cfg, snapshot, account, positions, trading_halted),
+            expected_output="Only valid JSON with one buy/sell/hold decision per portfolio symbol.",
+            agent=decision_agent,
+        )
+        crew = Crew(agents=[decision_agent], tasks=[task], process=Process.sequential, verbose=False)
+        raw_decision = str(crew.kickoff())
 
-        print(f"\n{'='*70}")
-        print(f"  {cfg['student_name']}'s Portfolio Crew — "
-              f"{len(cfg['portfolio']['stocks'])} stocks  |  "
-              f"${cfg['portfolio']['starting_capital']:,.0f} capital")
-        print(f"  Hedging: {'ON' if cfg['hedging']['enabled'] else 'OFF'}  |  "
-              f"LLM: {cfg['llm']['model']}")
-        print(f"{'='*70}\n")
+        decisions, validation_notes = _normalize_decisions(
+            raw_decision, symbols, cfg, account, positions, trading_halted
+        )
+        # The order server independently enforces account, position, cash,
+        # trade-frequency, halt, and other configured limits.
+        execution_result = _as_dict(_invoke_tool(
+            selected["place_portfolio_orders"],
+            {"decisions": decisions},
+        ))
 
-        result = crew.kickoff()
-
-        # Save each task's raw output to its own md file, per the brief's
-        # agentNameDDMMYYYY-HH:MM.md naming.
-        for agent_name, task in agent_task_pairs:
-            output_text = str(task.output) if task.output else "(no output captured)"
-            path = save_agent_log(log_dir, agent_name, output_text)
-            print(f"  logged: {path}")
-
-        print(f"\n{'='*70}\n  CYCLE COMPLETE\n{'='*70}\n")
-        print(result)
-        return result
+        save_agent_log(log_dir, "PortfolioDataFetcher", json.dumps(fetch_result, indent=2))
+        save_agent_log(log_dir, "PortfolioTechnicalAnalyst", json.dumps(snapshot, indent=2))
+        save_agent_log(log_dir, "PortfolioDecisionMaker", raw_decision)
+        save_agent_log(
+            log_dir,
+            "PortfolioExecutionAgent",
+            json.dumps({
+                "safety_before_order": safety,
+                "pre_order_validation_notes": validation_notes,
+                "normalized_decisions": decisions,
+                "execution": execution_result,
+            }, indent=2, default=str),
+        )
+        print(
+            f"\n{'='*64}\n"
+            f"  {cfg.get('student_name', 'Portfolio')} | {len(symbols)} symbols\n"
+            f"  LLM calls: 1 | model: {llm_cfg['model']} | Alpaca PAPER only\n"
+            f"  Options/regression: disabled in compact workflow\n"
+            f"  Safety halt active before order: {bool(safety.get('halted', False))}\n"
+            f"{'='*64}\n"
+        )
+        print(json.dumps({
+            "decisions": decisions,
+            "validation_notes": validation_notes,
+            "execution": execution_result,
+        }, indent=2, default=str))
+        return execution_result
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="../config/config.yaml")
+    parser.add_argument("--config", default="../config/config.example.yaml")
     args = parser.parse_args()
     run_one_cycle(args.config)
