@@ -55,31 +55,10 @@ hedging:
 # LLM backend
 llm:
   provider: "groq"
-  model: "groq/openai/gpt-oss-20b"   # check console.groq.com/docs/models for current free-tier model names before each run — Groq rotates/deprecates models
-  temperature: 0.1
-  max_tokens: 1200
+  model: "groq/openai/gpt-oss-120b"
+  fallback_models:
+    - "groq/qwen/qwen3.8-27b"
+    - "groq/openai/gpt-oss-20b"
+  temperature: 0.2
+  max_tokens: 1800
 
-# Indicator / data settings
-data:
-  lookback_days: 120
-  timeframe: "1Day"
-  beta_window_days: 60
-
-# Legacy optional volatility settings (not used in compact mode).
-# calculate_fear_regression needs at least fear_regression_window_days + 30
-# cached trading days (RSI's own warm-up period) — data.lookback_days above
-# (200 calendar days ≈ 135-140 trading days) comfortably covers the
-# default 60-day window. Raise this only if you also raise lookback_days.
-volatility:
-  fear_regression_window_days: 60
-
-# Session scheduling (informational — enforced by scripts/run_session.py,
-# which must run on YOUR machine; this chat/cloud session cannot stay
-# alive for the full window).
-session:
-  start_time_et: "09:30"     # = 19:00 IST
-  end_time_et: "16:00"       # = 01:30 IST next day
-  cycle_interval_minutes: 30  # how often the crew re-runs within the window
-
-logs:
-  run_dir: "logs"
