@@ -1,26 +1,27 @@
+﻿from zoneinfo import ZoneInfo
 """
 alpaca_orders_mcp_server.py
 -----------------------------
-Local MCP server #2: Alpaca PAPER trading execution — equities + options.
+Local MCP server #2: Alpaca PAPER trading execution â€” equities + options.
 
 SECURITY MODEL (read this before touching the file)
 -----------------------------------------------------
-Everything an agent sends this server — symbols, notionals, confidence
-scores, option contracts — is UNTRUSTED input. An LLM can hallucinate, a
+Everything an agent sends this server â€” symbols, notionals, confidence
+scores, option contracts â€” is UNTRUSTED input. An LLM can hallucinate, a
 decision-maker agent can emit malformed JSON, and a bug three layers up in
 trading_crew.py can pass through a bad value. This file does NOT trust the
 crew to have already applied the risk.* rules from config.yaml; it
 re-derives and enforces them itself, independently, every single call:
 
   1. Position size and cash buffer are checked here against LIVE account
-     equity fetched from Alpaca at call time — not against whatever the
+     equity fetched from Alpaca at call time â€” not against whatever the
      agent claims the portfolio is worth.
   2. `action` is matched against an explicit allow-list ("buy"/"sell"/
      "hold"). Anything else is REJECTED, never defaulted to a side.
   3. The options hedge independently re-parses the OCC symbol (underlying,
      expiry, type, strike), checks it against the configured allowed
      underlyings/expiry window, fetches a live quote, and caps premium
-     spend against the config limit — it does not trust the agent's own
+     spend against the config limit â€” it does not trust the agent's own
      cost estimate.
   4. A trading-halted flag is a FILE on disk (logs/<date>/.trading_halted),
      not a variable the Python process holds in memory. Once anything
@@ -31,7 +32,7 @@ re-derives and enforces them itself, independently, every single call:
 
 Env vars: ALPACA_API_KEY, ALPACA_SECRET_KEY (your PAPER keys), plus
 TRADING_CONFIG_PATH and TRADING_LOG_DIR, which trading_crew.py sets
-automatically when it launches this server as a subprocess — see
+automatically when it launches this server as a subprocess â€” see
 build_crew() in crew/trading_crew.py. Running this file some other way
 without those two set falls back to conservative hardcoded defaults
 (logged in every response's "limits_source" field so you can tell).
@@ -59,12 +60,28 @@ ALPACA_OPTIONS_DATA_URL = "https://data.alpaca.markets/v1beta1"
 DATA_HEADERS = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
 
 # paper=True pins every call in this file to Alpaca's paper-trading
-# endpoint — fake money, real order-routing behavior. Do not flip this to
+# endpoint â€” fake money, real order-routing behavior. Do not flip this to
 # False without a very deliberate conversation with yourself first.
 _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
+# Mandatory execution-boundary account isolation.
+_expected_account_id = os.environ.get("EXPECTED_ALPACA_ACCOUNT_ID", "").strip()
+if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+    raise RuntimeError("ORDER SERVER BLOCKED: Alpaca credentials are missing.")
+if not _expected_account_id:
+    raise RuntimeError(
+        "ORDER SERVER BLOCKED: no verified account ID was supplied. "
+        "Launch through scripts/run_isolated_session.py."
+    )
+_actual_account_id = str(_trading_client.get_account().id)
+if _actual_account_id != _expected_account_id:
+    raise RuntimeError(
+        "ORDER SERVER BLOCKED: Alpaca account ID does not match "
+        "the isolated launcher's verified account."
+    )
+
 # Conservative fallbacks used ONLY if TRADING_CONFIG_PATH isn't set/readable
-# — this should never happen when launched via trading_crew.py, but a
+# â€” this should never happen when launched via trading_crew.py, but a
 # missing config must fail SAFE (tighter limits), not fail open.
 _FALLBACK_LIMITS = {
     "max_position_weight_pct": 10,
@@ -81,7 +98,7 @@ _FALLBACK_LIMITS = {
 
 
 # ============================================================
-# Config / state loading — all re-read fresh each call (cheap, small
+# Config / state loading â€” all re-read fresh each call (cheap, small
 # files) rather than cached, so a config edit takes effect immediately
 # and a stale in-memory copy can never silently diverge from disk.
 # ============================================================
@@ -110,13 +127,61 @@ def _load_limits() -> dict:
     }
 
 
+def _allowed_equity_symbols() -> set[str]:
+    """Load the configured equity universe. Fail closed if unavailable."""
+    config_path = os.environ.get("TRADING_CONFIG_PATH", "").strip()
+
+    if not config_path or not os.path.isfile(config_path):
+        raise RuntimeError(
+            "Equity trading blocked: TRADING_CONFIG_PATH is missing "
+            "or does not point to a readable configuration file."
+        )
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        stocks = cfg["portfolio"]["stocks"]
+        symbols = {
+            str(item["symbol"]).strip().upper()
+            for item in stocks
+            if isinstance(item, dict) and item.get("symbol")
+        }
+
+        if not symbols:
+            raise ValueError("Portfolio stock list is empty.")
+
+        return symbols
+    except Exception as exc:
+        raise RuntimeError(
+            "Equity trading blocked: unable to load the configured "
+            f"ticker universe ({type(exc).__name__}: {exc})."
+        ) from exc
+
+
+def _validate_equity_buy_symbol(symbol: str) -> str | None:
+    """Return a rejection reason, or None when the symbol is allowed."""
+    try:
+        allowed = _allowed_equity_symbols()
+    except RuntimeError as exc:
+        return str(exc)
+
+    normalized = str(symbol).strip().upper()
+    if normalized not in allowed:
+        return (
+            f"REJECTED: {normalized or '<empty symbol>'} is not in the "
+            "configured equity universe for this session."
+        )
+    return None
+
+
 def _log_dir() -> Path:
     base = os.environ.get("TRADING_LOG_DIR", "logs")
     return Path(base)
 
 
 def _today_dir() -> Path:
-    d = _log_dir() / datetime.now().strftime("%d%m%Y")
+    d = _log_dir() / datetime.now(ZoneInfo("America/New_York")).strftime("%d%m%Y")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -134,7 +199,7 @@ def is_halted() -> tuple[bool, str]:
 
 def set_halted(reason: str) -> None:
     """
-    Write the halt flag to disk. Idempotent — if it's already halted for a
+    Write the halt flag to disk. Idempotent â€” if it's already halted for a
     different reason, the original reason is kept (first trip wins).
     """
     path = _halt_path()
@@ -169,7 +234,7 @@ def _trades_today(symbol: str) -> int:
 
 
 # ============================================================
-# OCC option symbol parsing — independent of whatever the agent claims
+# OCC option symbol parsing â€” independent of whatever the agent claims
 # about a contract; this is the actual ground truth parsed from the
 # symbol string itself. Format: ROOT + YYMMDD + C/P + strike*1000 (8 digits)
 # e.g. "SPY251121P00580000" -> SPY, 2025-11-21, PUT, strike 580.00
@@ -204,13 +269,29 @@ def _order_to_dict(order) -> dict:
 
 
 # ============================================================
-# Equities — single order (manual testing / human-in-the-loop CLI use —
+# Equities â€” single order (manual testing / human-in-the-loop CLI use â€”
 # NOT called by the crew, so it intentionally skips the portfolio-level
 # batch checks below; still rejects an invalid side explicitly)
 # ============================================================
+def _verify_execution_account() -> None:
+    """Fail closed if credentials no longer resolve to the isolated account."""
+    expected = os.environ.get("EXPECTED_ALPACA_ACCOUNT_ID", "").strip()
+    if not expected:
+        raise RuntimeError("ORDER BLOCKED: expected account ID is missing.")
+    account = _trading_client.get_account()
+    actual = str(account.id)
+    if actual != expected:
+        raise RuntimeError("ORDER BLOCKED: account ID mismatch.")
+
+
 @mcp.tool()
 def buy_stock(symbol: str, qty: float = None, notional: float = None) -> dict:
     """Place a PAPER-trading market BUY order. Pass exactly one of qty or notional."""
+    return {"error": "BLOCKED: direct buy_stock is disabled. Use the risk-checked portfolio batch workflow."}
+    rejection = _validate_equity_buy_symbol(symbol)
+    if rejection:
+        return {"error": rejection}
+
     halted, reason = is_halted()
     if halted:
         return {"error": "Trading halted for the rest of today.", "reason": reason}
@@ -227,10 +308,31 @@ def buy_stock(symbol: str, qty: float = None, notional: float = None) -> dict:
 @mcp.tool()
 def sell_stock(symbol: str, qty: float = None, notional: float = None) -> dict:
     """Place a PAPER-trading market SELL order. Pass exactly one of qty or notional."""
-    # Selling to close/reduce risk is allowed even while halted — only
+    # Selling to close/reduce risk is allowed even while halted â€” only
     # NEW buy exposure is blocked by the halt.
     if (qty is None) == (notional is None):
         return {"error": "Pass exactly one of qty or notional, not both/neither."}
+    try:
+        _verify_execution_account()
+        if qty is not None and (float(qty) <= 0):
+            return {"error": "REJECTED: sell quantity must be positive."}
+        if notional is not None and float(notional) <= 0:
+            return {"error": "REJECTED: sell notional must be positive."}
+
+        positions = {
+            str(pos.symbol).upper(): pos
+            for pos in _trading_client.get_all_positions()
+        }
+        held = positions.get(symbol.upper())
+        if held is None:
+            return {"error": "REJECTED: no live position exists for this symbol."}
+        if qty is not None and float(qty) > float(held.qty):
+            return {"error": "REJECTED: sell quantity exceeds live holdings."}
+        if notional is not None and float(notional) > abs(float(held.market_value)):
+            return {"error": "REJECTED: sell notional exceeds live position value."}
+    except Exception as exc:
+        return {"error": f"REJECTED: could not verify sell safety ({type(exc).__name__})."}
+
     order_request = MarketOrderRequest(
         symbol=symbol.upper(), qty=qty, notional=notional,
         side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
@@ -240,7 +342,7 @@ def sell_stock(symbol: str, qty: float = None, notional: float = None) -> dict:
 
 
 # ============================================================
-# Equities — WHOLE-PORTFOLIO batch order, WITH independent enforcement
+# Equities â€” WHOLE-PORTFOLIO batch order, WITH independent enforcement
 # of every risk.* rule from config.yaml. This is the hard control; the
 # decision-maker agent's own stated rules in its prompt are a SECOND
 # layer, not the only one.
@@ -259,12 +361,12 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
           "symbol": "NVDA",
           "action": "buy" | "sell" | "hold",
           "notional": 4500.0,     # dollar amount
-          "confidence": 0.72      # 0-1, REQUIRED for buy/sell — missing
+          "confidence": 0.72      # 0-1, REQUIRED for buy/sell â€” missing
                                   # or sub-threshold confidence is rejected
         }
 
     Any decision that fails a check is REJECTED with a reason and no order
-    is submitted for it — the batch keeps processing the remaining
+    is submitted for it â€” the batch keeps processing the remaining
     decisions rather than aborting entirely. If the account is currently
     halted (daily-loss stop tripped), ALL buy decisions are rejected
     without even checking the individual limits; sells still go through
@@ -280,8 +382,55 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
     max_position_dollars = portfolio_value * (limits["max_position_weight_pct"] / 100)
     min_cash_dollars = portfolio_value * (limits["min_cash_buffer_pct"] / 100)
 
+    # Risk snapshot: if positions/orders cannot be read, block buys safely.
+    risk_snapshot_error = None
+    position_values = {}
+    pending_buy_symbols = set()
+    pending_buy_exposure = 0.0
+    pending_buy_exposure_unknown = False
+
+    try:
+        for position in _trading_client.get_all_positions():
+            position_values[str(position.symbol).upper()] = max(
+                0.0, float(position.market_value or 0)
+            )
+
+        open_orders = _trading_client.get_orders()
+        open_statuses = {
+            "new", "accepted", "pending_new", "partially_filled",
+            "pending_replace", "accepted_for_bidding", "calculated",
+        }
+
+        for order in open_orders:
+            status = str(order.status).lower().split(".")[-1]
+            if status not in open_statuses:
+                continue
+            if str(order.side).lower().split(".")[-1] != "buy":
+                continue
+
+            order_symbol = str(order.symbol).upper()
+            pending_buy_symbols.add(order_symbol)
+
+            # Estimate reserved buying power for pending orders.
+            order_notional = getattr(order, "notional", None)
+            order_qty = getattr(order, "qty", None)
+            limit_price = getattr(order, "limit_price", None)
+
+            if order_notional is not None:
+                pending_buy_exposure += abs(float(order_notional))
+            elif order_qty is not None and limit_price is not None:
+                pending_buy_exposure += abs(float(order_qty) * float(limit_price))
+            else:
+                # A pending market order with quantity but no price has
+                # unknown remaining exposure. Fail closed for additional buys.
+                pending_buy_exposure_unknown = True
+
+    except Exception as exc:
+        risk_snapshot_error = str(exc)
+
     results = []
-    cash_committed_this_batch = 0.0  # running total of buy notional approved so far in THIS call
+    cash_committed_this_batch = 0.0
+    batch_buy_by_symbol = {}
 
     for d in decisions:
         symbol = str(d.get("symbol", "")).upper().strip()
@@ -290,7 +439,7 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
         confidence = d.get("confidence")
 
         # ---- Check 1: explicit action allow-list. Anything that isn't
-        # exactly "buy"/"sell"/"hold" is rejected outright — it NEVER
+        # exactly "buy"/"sell"/"hold" is rejected outright â€” it NEVER
         # falls through to becoming a sell or a buy by default. ----
         if action not in ("buy", "sell", "hold"):
             results.append({"symbol": symbol, "action": action, "result": f"REJECTED: unrecognized action '{action}' (must be buy/sell/hold)"})
@@ -300,7 +449,15 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
             results.append({"symbol": symbol, "action": "hold", "result": "skipped (hold)"})
             continue
 
-        # ---- Check 2: halt — only blocks NEW buys, not sells ----
+        # Independent server-side allow-list enforcement for new equity buys.
+        # Sells remain allowed so positions can still be reduced or closed.
+        if action == "buy":
+            rejection = _validate_equity_buy_symbol(symbol)
+            if rejection:
+                results.append({"symbol": symbol, "action": action, "result": rejection})
+                continue
+
+        # ---- Check 2: halt â€” only blocks NEW buys, not sells ----
         if action == "buy" and halted:
             results.append({"symbol": symbol, "action": action, "result": f"REJECTED: trading halted ({halt_reason})"})
             continue
@@ -311,7 +468,7 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
             continue
 
         if action == "buy":
-            # ---- Check 4: confidence — REQUIRED, not optional, for buys ----
+            # ---- Check 4: confidence â€” REQUIRED, not optional, for buys ----
             if not isinstance(confidence, (int, float)):
                 results.append({"symbol": symbol, "action": action, "result": "REJECTED: missing confidence score"})
                 continue
@@ -319,28 +476,80 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
                 results.append({"symbol": symbol, "action": action, "result": f"REJECTED: confidence {confidence} below minimum {limits['min_confidence_to_trade']}"})
                 continue
 
-            # ---- Check 5: position-size cap, against LIVE portfolio value ----
-            if notional > max_position_dollars:
-                results.append({"symbol": symbol, "action": action, "result": f"REJECTED: notional ${notional:,.2f} exceeds {limits['max_position_weight_pct']}% position cap (${max_position_dollars:,.2f})"})
+            # ---- Check 5: live aggregate position cap ----
+            if risk_snapshot_error:
+                results.append({
+                    "symbol": symbol, "action": action,
+                    "result": f"REJECTED: cannot verify live positions/open orders: {risk_snapshot_error}"
+                })
+                continue
+
+            if pending_buy_exposure_unknown:
+                results.append({
+                    "symbol": symbol, "action": action,
+                    "result": "REJECTED: an open buy order has unknown remaining exposure; wait for it to resolve."
+                })
+                continue
+
+            if symbol in pending_buy_symbols:
+                results.append({
+                    "symbol": symbol, "action": action,
+                    "result": "REJECTED: an open buy order already exists for this symbol."
+                })
+                continue
+
+            if symbol in batch_buy_by_symbol:
+                results.append({
+                    "symbol": symbol, "action": action,
+                    "result": "REJECTED: another buy for this symbol was already approved in this batch."
+                })
+                continue
+
+            existing_value = position_values.get(symbol, 0.0)
+            proposed_total = existing_value + float(notional)
+            if proposed_total > max_position_dollars:
+                results.append({
+                    "symbol": symbol, "action": action,
+                    "result": (
+                        f"REJECTED: existing holding ${existing_value:,.2f} + "
+                        f"proposed buy ${float(notional):,.2f} = ${proposed_total:,.2f}, "
+                        f"above {limits['max_position_weight_pct']}% cap "
+                        f"(${max_position_dollars:,.2f})."
+                    )
+                })
                 continue
 
             # ---- Check 6: cash buffer, accounting for everything already
             # approved earlier in this same batch (not just account cash
             # as of the start of the call) ----
-            projected_cash_after = cash - cash_committed_this_batch - notional
+            projected_cash_after = (
+                cash - pending_buy_exposure
+                - cash_committed_this_batch - float(notional)
+            )
             if projected_cash_after < min_cash_dollars:
                 results.append({"symbol": symbol, "action": action, "result": f"REJECTED: would breach {limits['min_cash_buffer_pct']}% cash buffer (projected cash ${projected_cash_after:,.2f} < required ${min_cash_dollars:,.2f})"})
                 continue
 
             # ---- Check 7: trade-frequency cap, persisted across the
             # whole day via the on-disk ledger, not just this call ----
-            trades_so_far = _trades_today(symbol)
-            if trades_so_far >= limits["max_trades_per_symbol_per_day"]:
-                results.append({"symbol": symbol, "action": action, "result": f"REJECTED: {symbol} already traded {trades_so_far}x today (limit {limits['max_trades_per_symbol_per_day']})"})
-                continue
+            # Daily BUY-frequency cap; SELLs must remain available.
+            if action == "buy":
+                trades_so_far = _trades_today(symbol)
+                if trades_so_far >= limits["max_trades_per_symbol_per_day"]:
+                    results.append({
+                        "symbol": symbol,
+                        "action": action,
+                        "result": (
+                            f"REJECTED: {symbol} already has {trades_so_far} "
+                            f"BUY submission(s) recorded today "
+                            f"(limit {limits['max_trades_per_symbol_per_day']})"
+                        ),
+                    })
+                    continue
 
-        # ---- All checks passed — submit ----
+        # ---- All checks passed â€” submit ----
         try:
+            _verify_execution_account()
             order_request = MarketOrderRequest(
                 symbol=symbol, notional=notional,
                 side=OrderSide.BUY if action == "buy" else OrderSide.SELL,
@@ -348,7 +557,10 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
             )
             order = _trading_client.submit_order(order_request)
             if action == "buy":
-                cash_committed_this_batch += notional
+                cash_committed_this_batch += float(notional)
+                batch_buy_by_symbol[symbol] = float(notional)
+            # Only successful BUY submissions consume the daily BUY allowance.
+            if action == "buy":
                 _increment_ledger(symbol)
             results.append({"symbol": symbol, "action": action, "result": _order_to_dict(order)})
         except Exception as exc:
@@ -364,7 +576,7 @@ def place_portfolio_orders(decisions: list[dict]) -> dict:
 
 
 # ============================================================
-# Options — tail hedge, WITH independent re-validation of the contract
+# Options â€” tail hedge, WITH independent re-validation of the contract
 # (not trusting the agent's claim about what it is) and a hard premium cap.
 # ============================================================
 @mcp.tool()
@@ -378,16 +590,16 @@ def buy_option_hedge(option_symbol: str, contracts: int) -> dict:
     limits = _load_limits()
 
     if not limits["hedging_enabled"]:
-        return {"error": "REJECTED: hedging.enabled is False in config.yaml — no hedge orders allowed."}
+        return {"error": "REJECTED: hedging.enabled is False in config.yaml â€” no hedge orders allowed."}
 
     halted, halt_reason = is_halted()
     if halted:
-        return {"error": f"REJECTED: trading halted ({halt_reason}) — no new hedge positions either."}
+        return {"error": f"REJECTED: trading halted ({halt_reason}) â€” no new hedge positions either."}
 
     if contracts <= 0 or contracts != int(contracts):
         return {"error": f"REJECTED: contracts must be a positive whole number, got {contracts}."}
 
-    # ---- Independently re-parse the OCC symbol — ground truth, not the
+    # ---- Independently re-parse the OCC symbol â€” ground truth, not the
     # agent's description of the contract ----
     try:
         parsed = parse_occ_symbol(option_symbol)
@@ -406,7 +618,7 @@ def buy_option_hedge(option_symbol: str, contracts: int) -> dict:
     if days_to_expiry > limits["hedge_max_expiration_days"]:
         return {"error": f"REJECTED: expiry {parsed['expiry']} is {days_to_expiry} days out, exceeds hedge_max_expiration_days={limits['hedge_max_expiration_days']}."}
 
-    # ---- Fetch a LIVE quote to estimate actual premium cost — never
+    # ---- Fetch a LIVE quote to estimate actual premium cost â€” never
     # trust a cost figure the agent stated ----
     try:
         quote_resp = requests.get(
@@ -493,7 +705,7 @@ def trip_daily_loss_halt(reason: str) -> dict:
     Manually (or programmatically, from run_session.py) trip the
     trading-halted flag for the rest of today. Idempotent. Use this
     instead of trying to track halt state in a Python variable somewhere
-    — the whole point is that it's a file every process checks.
+    â€” the whole point is that it's a file every process checks.
     """
     set_halted(reason)
     return {"halted": True, "reason": reason}
@@ -570,3 +782,4 @@ def get_account_info() -> dict:
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
+

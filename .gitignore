@@ -5,3 +5,31 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.env
+.env.aman
+.env.mayank
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local logs, reports, and generated metrics
+logs/
+metrics_data/
+metrics_data.zip
+trading_logs*.zip
+
+# Local backups
+*.bak
+*.backup
+*.bak_*
+*.before_*
+*.pre_*
+*.empty_recovery_backup
+*.py.*.bak
+

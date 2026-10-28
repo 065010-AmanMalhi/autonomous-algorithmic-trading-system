@@ -74,6 +74,7 @@ MARKET_FEAR_PROXY_SYMBOL = "VIXY"
 #   _cache[symbol] = pd.DataFrame of OHLCV bars, indexed by timestamp
 # ============================================================
 _cache: dict[str, pd.DataFrame] = {}
+_intraday_cache: dict[str, pd.DataFrame] = {}
 
 
 # ============================================================
@@ -105,7 +106,7 @@ def fetch_ohlcv_batch(
     lookback_days               : Calendar days of history — default 180
                                   (enough for MACD's 26-period slow EMA and a
                                   ~1yr-ish realized beta if you raise it to 365).
-    timeframe                   : Alpaca bar size — "1Day" (default) | "1Hour" | "15Min".
+    timeframe                   : Alpaca bar size, e.g. "1Day", "1Hour", "15Min", or "5Min".
     include_benchmark           : Also fetch SPY and cache it for calculate_beta,
                                   even if SPY isn't one of your portfolio symbols.
     include_market_fear_proxy   : Also fetch VIXY (market-wide fear/volatility
@@ -158,7 +159,13 @@ def fetch_ohlcv_batch(
         df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
         df = df[["open", "high", "low", "close", "volume"]]
 
-        _cache[symbol] = df
+        # Keep daily history separate from intraday history. Otherwise the
+        # intraday fetch overwrites daily bars and breaks beta/volatility tools.
+        normalized_timeframe = str(timeframe).strip()
+        if normalized_timeframe.lower() in {"1day", "day", "1d"}:
+            _cache[symbol] = df
+        else:
+            _intraday_cache[symbol] = df
         summary[symbol] = {
             "bars_fetched": len(df),
             "start": str(df.index[0]),
@@ -170,27 +177,34 @@ def fetch_ohlcv_batch(
 
     return {
         "symbols_requested": fetch_list,
-        "symbols_cached": [s for s in fetch_list if s in _cache],
+        "timeframe": timeframe,
+        "symbols_cached": [
+            s for s in fetch_list
+            if (s in _cache if str(timeframe).strip().lower() in {"1day", "day", "1d"}
+                else s in _intraday_cache)
+        ],
         "summary": summary,
         "status": "ok" if not missing else "partial",
     }
 
 
-def _get_df(symbol: str) -> pd.DataFrame:
+def _get_df(symbol: str, timeframe: str = "1Day") -> pd.DataFrame:
     symbol = symbol.upper()
-    if symbol not in _cache:
+    is_daily = str(timeframe).strip().lower() in {"1day", "day", "1d"}
+    cache = _cache if is_daily else _intraday_cache
+    if symbol not in cache:
         raise RuntimeError(
-            f"No cached data for {symbol}. Call fetch_ohlcv_batch with this "
-            "symbol included before calling an indicator tool."
+            f"No cached {timeframe} data for {symbol}. Call fetch_ohlcv_batch "
+            f"with this symbol and timeframe={timeframe!r} before calling an indicator tool."
         )
-    return _cache[symbol]
+    return cache[symbol]
 
 
 # ------------------------------------------------------------
 # 4.2 calculate_indicators — composite indicator bundle for ONE symbol
 # ------------------------------------------------------------
 @mcp.tool()
-def calculate_indicators(symbol: str) -> dict:
+def calculate_indicators(symbol: str, timeframe: str = "1Day") -> dict:
     """
     Calculate a bundle of technical indicators for one cached symbol:
     RSI(14), MACD(12/26/9), Bollinger Bands(20,2), ATR(14), SMA(20/50)
@@ -211,7 +225,7 @@ def calculate_indicators(symbol: str) -> dict:
     relative_volume, latest_close, as_of, bars_used.
     """
     symbol = symbol.upper()
-    df = _get_df(symbol)
+    df = _get_df(symbol, timeframe=timeframe)
 
     if len(df) < 55:
         raise ValueError(
@@ -268,6 +282,7 @@ def calculate_indicators(symbol: str) -> dict:
 
     return {
         "symbol": symbol,
+        "timeframe": timeframe,
         "latest_close": latest_close,
         "as_of": str(df.index[-1]),
         "bars_used": len(df),
@@ -362,6 +377,7 @@ def calculate_beta(symbol: str, window_days: int = 120) -> dict:
 def calculate_portfolio_snapshot(
     symbols: list[str],
     beta_window_days: int = 60,
+    timeframe: str = "1Day",
 ) -> dict:
     """
     Return one compact technical-indicator + realized-beta snapshot for a
@@ -374,10 +390,14 @@ def calculate_portfolio_snapshot(
     for raw_symbol in symbols:
         symbol = str(raw_symbol).upper().strip()
         try:
-            indicators = calculate_indicators(symbol)
+            indicators = calculate_indicators(symbol, timeframe=timeframe)
+            # Beta is always computed from the separate daily cache; intraday
+            # bars are not a substitute for daily returns in portfolio risk.
             beta_result = calculate_beta(symbol, beta_window_days)
             rows.append({
                 "symbol": symbol,
+                "timeframe": indicators.get("timeframe", timeframe),
+                "as_of": indicators.get("as_of"),
                 "close": indicators.get("latest_close"),
                 "rsi": (indicators.get("rsi") or {}).get("value"),
                 "rsi_signal": (indicators.get("rsi") or {}).get("signal"),
@@ -398,6 +418,7 @@ def calculate_portfolio_snapshot(
     average_beta = round(sum(valid_betas) / len(valid_betas), 3) if valid_betas else None
     return {
         "status": "ok" if not missing else ("partial" if rows else "error"),
+        "timeframe": timeframe,
         "rows": rows,
         "equal_weight_average_beta": average_beta,
         "missing": missing,

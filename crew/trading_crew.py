@@ -1,16 +1,17 @@
 """
 CrewAI multi-agent portfolio trader for Groq + local MCP servers.
 
-Python/MCP fetches and computes market evidence. Three CrewAI specialists analyze
-signals, build a portfolio plan, and produce a risk-constrained JSON decision set.
-Python validates decisions and the independent MCP order server remains the final
-authority for account, position, cash, frequency, halt, and paper-only controls.
+Python/MCP fetches and computes market evidence. The LLM decision-maker evaluates
+that evidence; Python validates the resulting decisions without replacing strategy
+choices with a rule-based trading signal. The independent MCP order server remains
+the final authority for account, position, cash, frequency, halt, and paper-only controls.
 """
 from __future__ import annotations
 
-# Workaround: remove CrewAI's unsupported cache marker for Groq.
-import crewai.llms.cache as _crewai_cache
-_crewai_cache.mark_cache_breakpoint = lambda message: message
+# The current decision call uses LiteLLM directly because the installed Groq
+# integration previously rejected CrewAI-injected cache-breakpoint metadata.
+# Strategy decisions are model-led; deterministic code is reserved for validation
+# and hard safety constraints. Full Crew orchestration is a separate migration step.
 
 import argparse
 import json
@@ -147,9 +148,14 @@ def _compact_snapshot(snapshot: dict) -> dict:
             "relative_volume": row.get("relative_volume"),
             "beta": row.get("beta"),
             "beta_class": row.get("beta_class"),
+            "intraday_data_missing": row.get("intraday_data_missing"),
+            "trend_timeframe": row.get("trend_timeframe"),
+            "signal_timeframe": row.get("signal_timeframe"),
         })
     return {
         "status": snapshot.get("status", "unknown"),
+        "trend_timeframe": snapshot.get("trend_timeframe"),
+        "signal_timeframe": snapshot.get("signal_timeframe"),
         "equal_weight_average_beta": snapshot.get("equal_weight_average_beta"),
         "rows": rows,
         "missing": [
@@ -300,7 +306,8 @@ def _deterministic_signal(
         f"line={round(macd_line, 6) if abs(macd_line) < 1e11 else 'missing'}, "
         f"signal={round(macd_signal, 6) if abs(macd_signal) < 1e11 else 'missing'}, "
         f"%B={round(bb, 3) if -10 < bb < 10 else 'missing'}, "
-        f"relative_volume={relvol if relvol >= 0 else 'missing'} (diagnostic only for 1Day bars)"
+        f"relative_volume={relvol if relvol >= 0 else 'missing'} "
+        f"(diagnostic only; signal timeframe={row.get('signal_timeframe', 'unknown')})"
     )
 
     if buy_eligible and position_headroom >= 1.0:
@@ -380,39 +387,17 @@ def _normalize_decisions(
             continue
         by_symbol[symbol] = item
 
-    # If the model says HOLD, independently check explicit technical entry/exit rules.
-    # A rule-based action is only proposed when measured fields meet the criteria; no forced trades.
-    rows_by_symbol = {
-        str(row.get("symbol", "")).upper(): row
-        for row in (snapshot or {}).get("rows", [])
-        if isinstance(row, dict)
-    }
+    # Agent decisions are authoritative for strategy selection. Do not replace a
+    # model HOLD with a deterministic technical-indicator BUY/SELL. The code below
+    # only validates schema, account constraints, and order safety; those are hard
+    # guardrails, not a second trading strategy.
     for symbol in symbols:
-        model_item = by_symbol.get(symbol, {})
-        if str(model_item.get("action", "hold")).lower().strip() != "hold":
-            continue
-        signal = _deterministic_signal(
-            rows_by_symbol.get(symbol, {}), positions, cfg, account, symbol, trading_halted
-        )
-        signal_action = signal.get("action", "hold")
-        if signal_action in {"buy", "sell"}:
+        if symbol not in by_symbol:
+            notes.append(f"{symbol}: agent omitted a decision; defaulted to HOLD")
             by_symbol[symbol] = {
-                "symbol": symbol,
-                "action": signal_action,
-                "notional": signal.get("notional", 0.0),
-                "confidence": signal.get("confidence", 0.0),
-                "reason": signal.get("reason", "deterministic rule signal"),
+                "symbol": symbol, "action": "hold", "notional": 0.0,
+                "confidence": 0.0, "reason": "agent decision missing",
             }
-            notes.append(
-                f"{symbol}: model HOLD overridden by rule-based {signal_action.upper()} "
-                f"(buy_score={signal.get('buy_score', 0)}, "
-                f"sell_score={signal.get('sell_score', 0)}; {signal.get('reason', '')})."
-            )
-        else:
-            notes.append(
-                f"{symbol}: rule HOLD (buy_score={signal.get('buy_score', 0)}, "
-                f"sell_score={signal.get('sell_score', 0)}; {signal.get('reason', '')})."
-            )
 
     limits = cfg.get("risk", {})
     equity = _number(account.get("portfolio_value"), _number(account.get("equity"), cfg["portfolio"]["starting_capital"]))
@@ -437,7 +422,11 @@ def _normalize_decisions(
             notes.append(f"{symbol}: invalid confidence converted to hold")
             action = "hold"
         if action == "buy":
-            if trading_halted:
+            signal_row = next((r for r in (snapshot or {}).get("rows", []) if str(r.get("symbol", "")).upper() == symbol), {})
+            if signal_row.get("intraday_data_missing", False):
+                notes.append(f"{symbol}: intraday evidence missing; BUY converted to HOLD")
+                action = "hold"
+            elif trading_halted:
                 notes.append(f"{symbol}: trading halt active; buy converted to hold")
                 action = "hold"
             elif confidence < confidence_floor:
@@ -504,31 +493,30 @@ def _decision_task_description(cfg: dict, snapshot: dict, account: dict, positio
     }
     description = (
         "Evaluate each symbol individually for an Alpaca PAPER account using only the supplied "
-        "market snapshot, positions, account, and limits. Trend is 'Up', 'Down', or 'Flat'. "
+        "market snapshot, positions, account, and limits. The trend field is from daily bars; "
+        "close, RSI, MACD, histogram, Bollinger %B and relative volume are from recent 5-minute bars. "
+        "Intraday data is mandatory for entries; if it is missing, HOLD. Trend is 'Up', 'Down', or 'Flat'. "
         "The macd field is a crossover category: 'Bullish', 'Bearish', or 'None'; 'None' means "
         "no fresh crossover, not that momentum is missing. macd_line, macd_signal, and "
         "macd_histogram are numeric; a positive histogram means MACD is above its signal line. "
         "RSI is numeric and bb_percent_b is a Bollinger position "
         "value normally between 0 and 1. relative_volume is diagnostic only: because the compact "
-        "workflow uses 1Day bars, the current bar's volume may be partial during market hours and "
-        "must not be treated as a full-session relative-volume reading.\n\n"
-        "ENTRY RULE: actively evaluate a small starter BUY when trend is 'Up', MACD histogram "
-        "is positive (or crossover is 'Bullish'), RSI is 35-75, and bb_percent_b is 0.15-0.85. "
-        "RSI 69-75 is allowed only when trend and momentum are positive and price remains below "
-        "the upper Bollinger zone; do not chase when %B > 0.85. Favor HOLD if histogram is "
-        "non-positive without a bullish crossover, price location is stretched, the trend is not Up, "
-        "required data is missing, or trading is halted. A fresh crossover is not required when "
-        "the histogram is already positive. "
-        "EXIT RULE: consider SELL only for an existing long position when trend is Down or MACD is "
-        "Bearish, and RSI <= 40 or bb_percent_b <= 0.2 confirms weakness. Never short, use leverage, "
-        "or propose options.\n\n"
+        "workflow uses 5-minute bars for fast indicators, relative volume is only a supporting "
+        "diagnostic and should not override trend/momentum or risk checks.\n\n"
+        "AGENTIC DECISION PROCESS: independently weigh the supplied evidence for each symbol; "
+        "consider trend, momentum, RSI, Bollinger position, data quality, current holdings, cash, "
+        "concentration, and opportunity cost together. These indicators are evidence, not a scorecard "
+        "that mechanically dictates the action. Explain uncertainty through confidence and choose "
+        "HOLD when the evidence does not justify a trade. Consider BUYs and SELLs when supported by "
+        "the overall evidence, but never invent data. Missing intraday data requires HOLD. Never "
+        "short, use leverage, or propose options. A trading halt prohibits BUYs.\n\n"
         "Confidence must reflect the evidence; buys must meet the configured confidence threshold. "
         "Never invent data. Python and the paper-order server independently enforce position size, "
         "cash buffer, daily trade frequency, and daily loss halt. Return only valid JSON with a "
         "'decisions' list containing exactly one entry per supplied symbol. Each entry must include "
         "symbol, action (buy/sell/hold), notional (zero for HOLD and positive for BUY), confidence "
         "(0-1), and reason (at most 8 words). Do not copy examples or output markdown.\n\n"
-        "DATA:\n" + json.dumps(context, separators=(",", ":"), ensure_ascii=True)
+        "DATA (compact; Python precomputed indicators):\n" + json.dumps(context, separators=(",", ":"), ensure_ascii=True)
     )
     return description
 
@@ -575,7 +563,10 @@ def _validate_model_output(raw: str, symbols: list[str]) -> None:
 def _run_decision_with_fallback(
     cfg: dict, task_description: str, symbols: list[str], api_key: str
 ) -> tuple[str, str, list[str]]:
+    """Generate validated portfolio decisions through a CrewAI multi-agent workflow."""
+    errors: list[str] = []
     llm_cfg = cfg["llm"]
+
     candidates = [llm_cfg.get("model"), *llm_cfg.get("fallback_models", [])]
     models = list(dict.fromkeys(
         model.strip() for model in candidates
@@ -583,131 +574,167 @@ def _run_decision_with_fallback(
     ))
     if not models:
         raise RuntimeError("No LLM models are configured")
-    errors = []
+
+    max_tokens = max(2400, min(int(llm_cfg.get("max_tokens", 3000)), 4096))
+    temperature = float(llm_cfg.get("temperature", 0.1))
+
+    system_rules = (
+        "You support an Alpaca PAPER-trading portfolio. Use only the supplied evidence. "
+        "Never invent market or portfolio data. Never short stocks, use leverage, "
+        "or propose options. If intraday_data_missing is true, recommend HOLD. "
+        "Daily trend is slow context; fast indicators use 5-minute bars. "
+        "BUY only when trend is Up, MACD histogram is positive or crossover is "
+        "Bullish, RSI is 35-75, and Bollinger %B is 0.15-0.85. "
+        "Never BUY during a trading halt. SELL only an existing long position "
+        "when trend is Down, or when MACD is Bearish and RSI <= 40 or Bollinger "
+        "%B <= 0.2. Otherwise HOLD. The independent validation and order server "
+        "remain authoritative for all risk limits."
+    )
+
     for model_name in models:
         try:
+            # Work around CrewAI cache metadata rejected by some Groq endpoints.
+            import crewai.llms.cache as crew_cache
+            crew_cache.mark_cache_breakpoint = lambda msg: msg
+
+            from crewai import Agent, Task, Crew, Process, LLM
+
             llm = LLM(
-                model=model_name, api_key=api_key,
-                temperature=float(llm_cfg.get("temperature", 0.2)),
-                max_tokens=int(llm_cfg.get("max_tokens", 1800)),
-            )
-            # Three real CrewAI specialists run sequentially on every successful cycle.
-            # All agents see evidence only; Python/order-server safeguards remain authoritative.
-            analyst = Agent(
-                role="Technical Signal Analyst",
-                goal="Identify evidence-backed trend and momentum candidates for every symbol.",
-                backstory=(
-                    "You are a technical analyst. Read numeric RSI, MACD histogram/lines, "
-                    "crossover, trend, and Bollinger %B carefully. None crossover means no "
-                    "fresh crossover, not missing momentum. Never invent market data."
-                ),
-                llm=llm, verbose=False, max_iter=1, allow_delegation=False,
-            )
-            strategist = Agent(
-                role="Portfolio Strategist",
-                goal="Turn technical evidence into balanced BUY, SELL, and HOLD proposals.",
-                backstory=(
-                    "You manage a diversified long-only paper portfolio. You seek valid "
-                    "opportunities without forcing trades, chasing extended prices, shorting, "
-                    "using leverage, or proposing options."
-                ),
-                llm=llm, verbose=False, max_iter=1, allow_delegation=False,
-            )
-            risk_supervisor = Agent(
-                role="Risk & Execution Supervisor",
-                goal="Produce the final schema-valid decision set within every configured limit.",
-                backstory=(
-                    "You are the final pre-trade reviewer. Never short or use leverage. "
-                    "Use exact positions/cash and leave the reserve intact. Halt means no buys. "
-                    "A SELL requires an existing long position."
-                ),
-                llm=llm, verbose=False, max_iter=1, allow_delegation=False,
+                model=model_name,
+                api_key=api_key,
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
 
-            analysis_task = Task(
-                description=(
-                    "Analyze all symbols in the supplied original market/account context. "
-                    "For every symbol, report trend, RSI, MACD crossover, MACD histogram, "
-                    "Bollinger %B, and classify the setup as bullish, mixed, or bearish. "
-                    "Explicitly identify whether positive histogram momentum persists without "
-                    "a fresh crossover. Identify possible entries only when trend is Up, "
-                    "RSI is 35-75, histogram is positive or crossover is Bullish, and %B is "
-                    "0.15-0.85. Keep it concise and numeric; do not size orders or invent data.\n\n"
-                    + task_description
+            technical_analyst = Agent(
+                role="Technical Evidence Analyst",
+                goal="Summarize supplied technical indicators without inventing evidence.",
+                backstory=(
+                    "You are a cautious technical analyst. Separate observed indicators "
+                    "from uncertainty and never make up missing values."
                 ),
-                expected_output="Concise per-symbol technical assessment using supplied numbers only.",
-                agent=analyst,
-            )
-            strategy_task = Task(
-                description=(
-                    "Use the technical analyst's findings to assess every symbol. Recommend "
-                    "BUY only for an Up trend, RSI 35-75, positive MACD histogram or Bullish "
-                    "crossover, and Bollinger %B 0.15-0.85. RSI 69-75 is not an automatic veto "
-                    "when momentum is positive and price remains in that band. Avoid chasing %B "
-                    "above 0.85. SELL only an existing long when trend is Down or MACD is Bearish "
-                    "and RSI <= 40 or %B <= 0.20 confirms weakness. Otherwise HOLD. Consider all "
-                    "eligible candidates; do not default the entire portfolio to HOLD without "
-                    "evaluating each row. Return a concise symbol/action/reason proposal, not JSON."
-                ),
-                expected_output="Concise proposed portfolio actions with an evidence-based reason per candidate.",
-                agent=strategist,
-                context=[analysis_task],
-            )
-            decision_task = Task(
-                description=(
-                    "Finalize the entire portfolio from the original evidence and preceding "
-                    "specialist outputs. Apply the stated rules; do not force a trade where no "
-                    "candidate qualifies, but do not leave eligible candidates at HOLD merely "
-                    "because RSI is between 69 and 75 when positive momentum and %B 0.15-0.85 "
-                    "agree. Return only valid JSON with exactly one entry per supplied symbol, "
-                    "keys symbol/action/notional/confidence/reason, and actions buy/sell/hold. "
-                    "HOLD notional must be 0. Buy notional must be positive and within the "
-                    "max_position_dollars and cash reserve; use a starter size near 25% of the "
-                    "per-position cap where account capacity permits. Confidence must be 0-1 and "
-                    "meet the configured minimum for BUY. Never buy during a halt. Never short, "
-                    "use leverage, invent data, or propose options. Limit each reason to 8 words.\n\n"
-                    "ORIGINAL EVIDENCE AND LIMITS:\n" + task_description
-                ),
-                expected_output="Only valid JSON with one risk-reviewed decision per portfolio symbol.",
-                agent=risk_supervisor,
-                context=[analysis_task, strategy_task],
-            )
-            crew = Crew(
-                agents=[analyst, strategist, risk_supervisor],
-                tasks=[analysis_task, strategy_task, decision_task],
-                process=Process.sequential,
+                llm=llm,
+                allow_delegation=False,
                 verbose=False,
             )
-            print("  CrewAI pipeline: Technical Signal Analyst -> Portfolio Strategist -> Risk & Execution Supervisor")
-            raw = str(crew.kickoff())
-            # Keep each specialist's actual CrewAI output for the assignment audit trail.
-            for stage_name, stage_task in (
-                ("TechnicalSignalAnalyst", analysis_task),
-                ("PortfolioStrategist", strategy_task),
-                ("RiskExecutionSupervisor", decision_task),
-            ):
-                stage_output = getattr(stage_task, "output", None)
-                if stage_output is not None:
-                    stage_text = getattr(stage_output, "raw", None) or str(stage_output)
-                    try:
-                        save_agent_log(cfg.get("logs", {}).get("run_dir", "logs"), stage_name, str(stage_text))
-                    except Exception as log_exc:
-                        print(f"  [CrewAI log warning] {stage_name}: {type(log_exc).__name__}: {log_exc}")
+
+            risk_analyst = Agent(
+                role="Portfolio and Risk Analyst",
+                goal="Assess the supplied portfolio, available cash, positions, and risk constraints.",
+                backstory=(
+                    "You are a conservative portfolio risk analyst. Identify missing "
+                    "data, existing holdings, cash constraints, and trading halts."
+                ),
+                llm=llm,
+                allow_delegation=False,
+                verbose=False,
+            )
+
+            decision_maker = Agent(
+                role="Portfolio Decision Maker",
+                goal="Produce one evidence-based, schema-valid decision for every required symbol.",
+                backstory=(
+                    "You reconcile technical evidence with portfolio risk. When evidence "
+                    "is insufficient or conflicting, prefer HOLD. Follow the required JSON schema."
+                ),
+                llm=llm,
+                allow_delegation=False,
+                verbose=False,
+            )
+
+            technical_task = Task(
+                description=(
+                    f"Analyze the following trading evidence.\n{task_description}\n\n"
+                    f"Required symbols: {symbols}\n\n{system_rules}\n\n"
+                    "Report the observed trend, MACD, RSI, Bollinger %B, missing data, "
+                    "and relevant halt information for each symbol. Do not invent values."
+                ),
+                expected_output=(
+                    "A concise per-symbol technical evidence report, explicitly identifying "
+                    "missing or unavailable evidence."
+                ),
+                agent=technical_analyst,
+            )
+
+            risk_task = Task(
+                description=(
+                    f"Review the same supplied evidence for portfolio and execution risks.\n"
+                    f"{task_description}\n\nRequired symbols: {symbols}\n\n"
+                    "Identify available cash, current positions, position limits, cash buffer, "
+                    "halts, missing data, and any constraints relevant to each symbol. "
+                    "Do not invent values. Recommend conservative limits where evidence supports them."
+                ),
+                expected_output=(
+                    "A concise risk report identifying supported constraints, existing holdings, "
+                    "and any uncertainty."
+                ),
+                agent=risk_analyst,
+            )
+
+            decision_task = Task(
+                description=(
+                    f"Create exactly one decision for each symbol in this order: {symbols}.\n\n"
+                    f"Original supplied evidence:\n{task_description}\n\n"
+                    f"Technical analysis: use the preceding technical report. "
+                    f"Risk analysis: use the preceding risk report.\n\n{system_rules}\n\n"
+                    "Return only a JSON object with this exact structure: "
+                    '{"decisions":[{"symbol":"XYZ","action":"hold","notional":0,'
+                    '"confidence":0.0,"reason":"short reason"}]}. '
+                    "Actions must be buy, sell, or hold. HOLD notional must be 0; "
+                    "BUY notional must be positive. Reason must be at most 8 words. "
+                    "Do not use markdown or include extra keys. If evidence is insufficient, HOLD."
+                ),
+                expected_output=(
+                    "A JSON object containing a decisions array with exactly one valid decision "
+                    "for every required symbol."
+                ),
+                agent=decision_maker,
+                context=[technical_task, risk_task],
+            )
+
+            crew = Crew(
+                agents=[technical_analyst, risk_analyst, decision_maker],
+                tasks=[technical_task, risk_task, decision_task],
+                process=Process.sequential,
+                verbose=True,
+            )
+
+            print(f"  Decision workflow: CrewAI multi-agent; model={model_name}")
+            result = crew.kickoff()
+            raw = str(result).strip()
+
+            print(f"  CrewAI response length: {len(raw)} characters")
             _validate_model_output(raw, symbols)
+
+            try:
+                save_agent_log(
+                    cfg.get("logs", {}).get("run_dir", "logs"),
+                    "PortfolioDecisionMaker",
+                    raw,
+                )
+            except Exception as log_exc:
+                print(
+                    "  [LLM log warning] PortfolioDecisionMaker: "
+                    f"{type(log_exc).__name__}: {log_exc}"
+                )
+
             if errors:
                 print(
                     f"  Model fallback succeeded: {model_name} "
                     f"after {len(errors)} failed attempt(s)."
                 )
             return raw, model_name, errors
+
         except Exception as exc:
             message = f"{type(exc).__name__}: {str(exc)[:220]}"
             errors.append(f"{model_name} -> {message}")
             print(f"  [LLM fallback] {model_name} failed: {message}")
+
     raise RuntimeError(
-        "All configured LLM models failed validation/access; no orders submitted. "
+        "All configured CrewAI models failed validation/access; no orders submitted. "
         + " | ".join(errors)
     )
+
 
 def run_one_cycle(config_path: str):
     cfg = load_config(config_path)
@@ -740,21 +767,79 @@ def run_one_cycle(config_path: str):
             "place_portfolio_orders",
         )
         data_cfg = cfg["data"]
-        # Data calls are direct MCP invocations, not LLM tool calls.
-        fetch_result = _as_dict(_invoke_tool(selected["fetch_ohlcv_batch"], {
+        # Python fetches and computes both timeframes; only compact, numeric
+        # evidence is sent to the LLM. Daily bars establish the broader trend;
+        # 5-minute bars drive near-term momentum/entry timing.
+        daily_timeframe = str(data_cfg.get("trend_timeframe", "1Day"))
+        daily_lookback = int(data_cfg.get("lookback_days", 120))
+        daily_fetch = _as_dict(_invoke_tool(selected["fetch_ohlcv_batch"], {
             "symbols": symbols,
-            "lookback_days": int(data_cfg.get("lookback_days", 120)),
-            "timeframe": data_cfg.get("timeframe", "1Day"),
+            "lookback_days": daily_lookback,
+            "timeframe": daily_timeframe,
             "include_benchmark": True,
             "include_market_fear_proxy": False,
         }))
-        if fetch_result.get("status") not in {"ok", "partial"}:
-            raise RuntimeError(f"OHLCV fetch failed; refusing to ask the model to trade: {fetch_result}")
-        snapshot_raw = _as_dict(_invoke_tool(selected["calculate_portfolio_snapshot"], {
+        if daily_fetch.get("status") not in {"ok", "partial"}:
+            raise RuntimeError(f"Daily market-data fetch failed; refusing to trade: {daily_fetch}")
+        daily_snapshot_raw = _as_dict(_invoke_tool(selected["calculate_portfolio_snapshot"], {
             "symbols": symbols,
             "beta_window_days": int(data_cfg.get("beta_window_days", 60)),
         }))
-        snapshot = _compact_snapshot(snapshot_raw)
+        daily_snapshot = _compact_snapshot(daily_snapshot_raw)
+
+        intraday_timeframe = str(data_cfg.get("signal_timeframe", "5Min"))
+        intraday_lookback = int(data_cfg.get("intraday_lookback_days", 5))
+        intraday_fetch = _as_dict(_invoke_tool(selected["fetch_ohlcv_batch"], {
+            "symbols": symbols,
+            "lookback_days": intraday_lookback,
+            "timeframe": intraday_timeframe,
+            "include_benchmark": False,
+            "include_market_fear_proxy": False,
+        }))
+        if intraday_fetch.get("status") not in {"ok", "partial"}:
+            raise RuntimeError(f"Intraday market-data fetch failed; refusing to trade: {intraday_fetch}")
+        intraday_snapshot_raw = _as_dict(_invoke_tool(selected["calculate_portfolio_snapshot"], {
+            "symbols": symbols,
+            "beta_window_days": int(data_cfg.get("beta_window_days", 60)),
+            # Explicitly calculate fast indicators from the intraday bars just fetched.
+            # The patched MCP server continues to calculate beta from daily data.
+            "timeframe": intraday_timeframe,
+        }))
+        intraday_snapshot = _compact_snapshot(intraday_snapshot_raw)
+
+        # Keep the daily trend and beta, but replace fast indicators and price
+        # with their latest intraday values. This prevents a daily MACD/RSI from
+        # being mistaken for a fresh 5-minute signal.
+        daily_by_symbol = {r["symbol"]: r for r in daily_snapshot.get("rows", [])}
+        intraday_by_symbol = {r["symbol"]: r for r in intraday_snapshot.get("rows", [])}
+        merged_rows = []
+        fast_fields = (
+            "close", "rsi", "rsi_signal", "macd", "macd_line", "macd_signal",
+            "macd_histogram", "bb_percent_b", "relative_volume",
+        )
+        for symbol in symbols:
+            daily_row = dict(daily_by_symbol.get(symbol, {"symbol": symbol}))
+            intraday_row = intraday_by_symbol.get(symbol, {})
+            if not intraday_row:
+                daily_row["intraday_data_missing"] = True
+            else:
+                for field in fast_fields:
+                    if intraday_row.get(field) is not None:
+                        daily_row[field] = intraday_row[field]
+                daily_row["intraday_data_missing"] = False
+            daily_row["trend_timeframe"] = daily_timeframe
+            daily_row["signal_timeframe"] = intraday_timeframe
+            merged_rows.append(daily_row)
+        snapshot = {
+            "status": "ok" if daily_snapshot.get("status") == "ok" and intraday_snapshot.get("status") == "ok" else "partial",
+            "trend_timeframe": daily_timeframe,
+            "signal_timeframe": intraday_timeframe,
+            "rows": merged_rows,
+            "missing": (daily_snapshot.get("missing", []) + intraday_snapshot.get("missing", []))[:30],
+        }
+        if not any(not row.get("intraday_data_missing", True) for row in merged_rows):
+            raise RuntimeError("No intraday indicator rows were returned; refusing to trade on stale daily-only signals.")
+        fetch_result = {"daily": daily_fetch, "intraday": intraday_fetch}
         account = _as_dict(_invoke_tool(selected["get_account_info"], {}))
         positions_raw = _as_dict(_invoke_tool(selected["get_all_positions"], {}))
         safety = _as_dict(_invoke_tool(selected["get_safety_status"], {}))
